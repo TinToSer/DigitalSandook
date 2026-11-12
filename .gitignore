@@ -1,0 +1,24 @@
+# build output
+/dist/
+*.exe
+
+# runtime data: password hashes, TLS private key, audit log - never commit
+dsd-data/
+state.json
+state.json.bak
+audit.log
+*.pem
+*.key
+.env
+
+# test / coverage
+*.out
+coverage.*
+
+# editors / OS / local tooling
+.vscode/
+.idea/
+.claude/
+*.swp
+.DS_Store
+Thumbs.db

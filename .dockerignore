@@ -1,0 +1,7 @@
+.git
+.github
+dist
+dsd-data
+*.md
+!README.md
+scripts

@@ -1,0 +1,14 @@
+# docker compose up -d   ->   https://localhost:8443  (first-run admin password: docker compose logs)
+services:
+  digitalsandook:
+    image: ghcr.io/tintoser/digitalsandook:latest
+    restart: unless-stopped
+    ports:
+      - "8443:8443"
+    volumes:
+      - dsd-data:/data                  # users, TLS certificate, audit log
+      - /path/to/your/files:/shares/files   # a folder to share (must be writable by uid 65532)
+    command: ["-data", "/data", "-share", "Files=/shares/files"]
+
+volumes:
+  dsd-data:
