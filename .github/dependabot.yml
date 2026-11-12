@@ -1,11 +1,14 @@
 version: 2
+# Keep noise low: one grouped PR per ecosystem, once a month.
+# (The project has no third-party Go modules, so there is no gomod entry.)
 updates:
   - package-ecosystem: github-actions
     directory: /
-    schedule: { interval: weekly }
+    schedule: { interval: monthly }
+    open-pull-requests-limit: 1
+    groups:
+      actions: { patterns: ["*"] }
   - package-ecosystem: docker
     directory: /
-    schedule: { interval: weekly }
-  - package-ecosystem: gomod
-    directory: /
-    schedule: { interval: weekly }
+    schedule: { interval: monthly }
+    open-pull-requests-limit: 1
