@@ -5,6 +5,9 @@ and the project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Documentation
+* Added a tested reverse-proxy (nginx / Caddy) guide.
+
 ## [1.0.0]
 
 Initial public release: multi-user web file manager in a single dependency-free binary, with kernel-enforced

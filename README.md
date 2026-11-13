@@ -111,6 +111,51 @@ Back it up by copying that folder; `state.json.bak` is kept automatically.
 Stop the server first - `resetpw` refuses to run while the server is using the same data folder.
 `DigitalSanDook version` prints the version.
 
+## Behind a reverse proxy (nginx / Caddy)
+
+Let the proxy handle HTTPS and run DigitalSanDook on loopback over plain HTTP:
+
+```
+DigitalSanDook -http -addr 127.0.0.1:1716 -trust-proxy -share Files=/srv/files
+```
+
+**nginx** (certbot-managed `ssl_*` lines go in the same `server` block):
+
+```nginx
+server {
+    server_name files.example.com;
+    listen 443 ssl;
+
+    client_max_body_size 0;                   # uploads are chunked; do not cap them
+
+    location / {
+        proxy_pass http://127.0.0.1:1716;
+        proxy_http_version 1.1;
+        proxy_set_header Host              $http_host;   # REQUIRED, see below
+        proxy_set_header X-Forwarded-For   $remote_addr; # real client IP for lockout + audit log
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_request_buffering off;          # stream uploads
+        proxy_buffering off;                  # stream downloads / ZIP
+        proxy_read_timeout 1h;
+        proxy_send_timeout 1h;
+    }
+}
+```
+
+**Caddy:** `files.example.com { reverse_proxy 127.0.0.1:1716 }` (Caddy sets everything correctly by default).
+
+Why each part matters:
+
+* **`Host` must reach the app unchanged.** State-changing requests (including login) are accepted only when the
+  browser's `Origin` equals the request's `Host`. nginx's default (`Host: 127.0.0.1:1716`) makes every login fail
+  with `request rejected`.
+* **`-trust-proxy`** makes the app use `X-Forwarded-For` / `X-Forwarded-Proto`. Without it every visitor looks like
+  `127.0.0.1`, so one person's failed logins lock out everybody, and the audit log shows no real addresses.
+  Only enable it when the app is reachable **only** through your proxy (bind to `127.0.0.1`).
+* **Do not redirect POST requests.** A `301/302` turns a `POST /api/login` into a `GET`, which the server answers
+  with `405 Method Not Allowed`. Always open the site by its final `https://` address and keep the port-80 server a
+  plain `return 301` for page loads only.
+
 ## Access model
 
 | level | can |
