@@ -16,9 +16,23 @@ no installer, no database, no runtime, no dependencies.
 ![Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen)
 ![Platforms](https://img.shields.io/badge/platforms-windows%20%7C%20linux%20%7C%20macos%20%7C%20bsd-lightgrey)
 
+[**Website & Live Showcase**](https://tintoser.github.io/DigitalSandook/) · [**Download Latest Release**](https://github.com/TinToSer/DigitalSandook/releases/latest) · [**Security Policy**](SECURITY.md)
+
+<br>
+
+<img src="docs/screenshots/grid-dark.png" alt="DigitalSanDook Grid View (Dark Mode)" width="100%">
+
 </div>
 
 > *Sandook* (संदूक / صندوق) means "chest" or "box" in Hindi and Urdu - a digital chest for your files.
+
+## Screenshots
+
+| Dark Mode (Grid & Thumbnails) | Light Mode (List View) |
+|---|---|
+| ![Grid Dark](docs/screenshots/grid-dark.png) | ![List Light](docs/screenshots/list-light.png) |
+| **Public & File-Drop Sharing** | **Tamper-Evident Audit Log** |
+| ![Share Dialog](docs/screenshots/share-dark.png) | ![Admin Audit](docs/screenshots/admin-audit.png) |
 
 ## Why DigitalSanDook?
 

@@ -1,0 +1,451 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>DigitalSanDook — Single-Binary, Hardened Self-Hosted File Cloud</title>
+<meta name="description" content="Your own private file cloud in a single ~7 MB zero-dependency Go binary. TOTP 2FA, kernel-jailed folders, resumable chunked uploads, file-drop links, recycle bin, in-browser editor & Cloudflare Tunnel.">
+<meta property="og:type" content="website">
+<meta property="og:title" content="DigitalSanDook — Single-Binary, Hardened Self-Hosted File Cloud">
+<meta property="og:description" content="Share any folder with TOTP 2FA, kernel-enforced os.Root jail, resumable adaptive chunked uploads, file-drop links, recycle bin & isolated Cloudflare Tunnel. Zero dependencies.">
+<meta property="og:image" content="https://tintoser.github.io/DigitalSandook/screenshots/grid-dark.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="DigitalSanDook — Single-Binary Self-Hosted File Cloud">
+<meta name="twitter:description" content="One ~7 MB Go binary. Zero dependencies. Hardened by default.">
+<meta name="twitter:image" content="https://tintoser.github.io/DigitalSandook/screenshots/grid-dark.png">
+<link rel="icon" href="logo.svg" type="image/svg+xml">
+<style>
+:root {
+  --bg: #070b14;
+  --bg2: #0d1424;
+  --card: rgba(17, 25, 45, 0.72);
+  --bd: rgba(148, 163, 184, 0.16);
+  --bd-hi: rgba(99, 102, 241, 0.45);
+  --fg: #f1f5f9;
+  --muted: #94a3b8;
+  --acc: #6366f1;
+  --acc2: #22d3ee;
+  --ok: #34d399;
+  --rad: 16px;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html { scroll-behavior: smooth; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, Helvetica, Arial, sans-serif;
+  background: var(--bg);
+  color: var(--fg);
+  line-height: 1.6;
+  overflow-x: hidden;
+  -webkit-font-smoothing: antialiased;
+}
+.glow {
+  position: fixed; inset: 0; z-index: -1; pointer-events: none;
+  background:
+    radial-gradient(60rem 36rem at 18% -5%, rgba(99, 102, 241, 0.22), transparent 60%),
+    radial-gradient(50rem 32rem at 85% 10%, rgba(34, 211, 238, 0.15), transparent 60%),
+    radial-gradient(45rem 30rem at 50% 95%, rgba(52, 211, 153, 0.08), transparent 60%);
+}
+a { color: inherit; text-decoration: none; }
+.wrap { max-width: 1140px; margin: 0 auto; padding: 0 24px; }
+
+/* Nav */
+header {
+  position: sticky; top: 0; z-index: 40;
+  backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
+  background: rgba(7, 11, 20, 0.76);
+  border-bottom: 1px solid var(--bd);
+}
+.nav {
+  display: flex; align-items: center; justify-content: space-between;
+  height: 66px; gap: 20px;
+}
+.brand { display: flex; align-items: center; gap: 10px; font-weight: 700; font-size: 1.08rem; letter-spacing: -0.02em; }
+.brand img { width: 30px; height: 30px; }
+.nav-links { display: flex; align-items: center; gap: 24px; color: var(--muted); font-size: 0.92rem; }
+.nav-links a:hover { color: var(--fg); }
+.btn {
+  display: inline-flex; align-items: center; gap: 8px;
+  padding: 10px 18px; border-radius: 10px; font-weight: 600; font-size: 0.92rem;
+  border: 1px solid var(--bd); background: rgba(255,255,255,0.04); color: var(--fg);
+  cursor: pointer; transition: transform .15s, border-color .15s, background .15s, box-shadow .15s;
+}
+.btn:hover { border-color: var(--bd-hi); background: rgba(99,102,241,0.12); transform: translateY(-1px); }
+.btn.primary {
+  background: linear-gradient(135deg, #6366f1, #06b6d4);
+  border: 0; color: #fff;
+  box-shadow: 0 8px 28px rgba(99, 102, 241, 0.35);
+}
+.btn.primary:hover { box-shadow: 0 12px 34px rgba(6, 182, 212, 0.42); filter: brightness(1.06); }
+.btn.sm { padding: 7px 13px; font-size: 0.84rem; border-radius: 8px; }
+
+/* Hero */
+.hero { text-align: center; padding: 78px 0 42px; }
+.pill {
+  display: inline-flex; align-items: center; gap: 8px;
+  padding: 6px 14px; border-radius: 999px; font-size: 0.82rem; font-weight: 600;
+  color: #a5b4fc; background: rgba(99,102,241,0.12); border: 1px solid rgba(99,102,241,0.32);
+  margin-bottom: 22px;
+}
+.pill .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--ok); box-shadow: 0 0 10px var(--ok); }
+h1 {
+  font-size: clamp(2.3rem, 5.4vw, 4.1rem);
+  font-weight: 800; letter-spacing: -0.035em; line-height: 1.08;
+  max-width: 880px; margin: 0 auto 20px;
+}
+.grad {
+  background: linear-gradient(135deg, #ffffff 10%, #a5b4fc 55%, #22d3ee 100%);
+  -webkit-background-clip: text; background-clip: text; color: transparent;
+}
+.lead {
+  font-size: clamp(1.02rem, 1.8vw, 1.22rem); color: var(--muted);
+  max-width: 700px; margin: 0 auto 30px;
+}
+.cta { display: flex; flex-wrap: wrap; justify-content: center; gap: 12px; margin-bottom: 42px; }
+
+/* Stats */
+.stats {
+  display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px;
+  max-width: 820px; margin: 0 auto 56px;
+}
+.stat {
+  background: var(--card); border: 1px solid var(--bd); border-radius: 14px;
+  padding: 16px 12px; backdrop-filter: blur(10px);
+}
+.stat b { display: block; font-size: 1.55rem; font-weight: 800; letter-spacing: -0.02em; color: #fff; }
+.stat span { font-size: 0.8rem; color: var(--muted); }
+
+/* Screenshot Showcase */
+.showcase { margin: 0 auto 88px; }
+.tabs { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; margin-bottom: 18px; }
+.tab {
+  padding: 8px 16px; border-radius: 999px; font-size: 0.86rem; font-weight: 600;
+  color: var(--muted); background: rgba(255,255,255,0.03); border: 1px solid var(--bd);
+  cursor: pointer; transition: all .15s;
+}
+.tab:hover { color: var(--fg); border-color: var(--bd-hi); }
+.tab.on { background: rgba(99,102,241,0.2); color: #fff; border-color: rgba(99,102,241,0.65); }
+.frame {
+  border-radius: 18px; overflow: hidden;
+  border: 1px solid rgba(148,163,184,0.24);
+  background: #0b1120;
+  box-shadow: 0 30px 90px rgba(0, 0, 0, 0.65), 0 0 0 1px rgba(255,255,255,0.04) inset;
+}
+.chrome {
+  display: flex; align-items: center; gap: 8px; padding: 11px 16px;
+  background: rgba(15, 23, 42, 0.92); border-bottom: 1px solid var(--bd);
+}
+.chrome i { width: 11px; height: 11px; border-radius: 50%; display: inline-block; }
+.chrome .r { background: #ef4444; } .chrome .y { background: #f59e0b; } .chrome .g { background: #10b981; }
+.chrome .url {
+  margin-left: 12px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.78rem; color: var(--muted); background: rgba(0,0,0,0.3);
+  padding: 3px 12px; border-radius: 6px; border: 1px solid var(--bd);
+}
+.shot-wrap { position: relative; background: #0b1120; cursor: zoom-in; }
+.shot-wrap img { width: 100%; display: block; aspect-ratio: 16 / 10; object-fit: cover; object-position: top; }
+.caption {
+  padding: 13px 18px; font-size: 0.88rem; color: var(--muted);
+  border-top: 1px solid var(--bd); display: flex; justify-content: space-between; align-items: center; gap: 12px;
+}
+
+/* Sections */
+section { padding: 64px 0; }
+.sec-hd { text-align: center; max-width: 680px; margin: 0 auto 44px; }
+.sec-hd h2 { font-size: clamp(1.7rem, 3.2vw, 2.45rem); font-weight: 800; letter-spacing: -0.025em; margin-bottom: 10px; }
+.sec-hd p { color: var(--muted); font-size: 1rem; }
+
+/* Feature Grid */
+.grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px; }
+.card {
+  background: var(--card); border: 1px solid var(--bd); border-radius: var(--rad);
+  padding: 24px; transition: border-color .2s, transform .2s;
+}
+.card:hover { border-color: var(--bd-hi); transform: translateY(-2px); }
+.ico {
+  width: 42px; height: 42px; border-radius: 11px; margin-bottom: 14px;
+  display: grid; place-items: center; font-size: 1.25rem;
+  background: linear-gradient(135deg, rgba(99,102,241,0.22), rgba(34,211,238,0.16));
+  border: 1px solid rgba(99,102,241,0.35);
+}
+.card h3 { font-size: 1.08rem; font-weight: 700; margin-bottom: 8px; }
+.card p { font-size: 0.91rem; color: var(--muted); }
+
+/* Comparison Table */
+.tbl-wrap {
+  overflow-x: auto; border-radius: var(--rad); border: 1px solid var(--bd);
+  background: var(--card);
+}
+table { width: 100%; border-collapse: collapse; font-size: 0.93rem; }
+th, td { padding: 14px 18px; text-align: left; border-bottom: 1px solid var(--bd); }
+thead th { background: rgba(15,23,42,0.75); font-weight: 700; color: #fff; }
+tbody tr:last-child td { border-bottom: 0; }
+.yes { color: var(--ok); font-weight: 700; }
+.no { color: #64748b; }
+.hi-col { background: rgba(99,102,241,0.08); }
+
+/* Install */
+.code-box {
+  max-width: 780px; margin: 0 auto;
+  background: #0a101f; border: 1px solid var(--bd); border-radius: var(--rad); overflow: hidden;
+}
+.code-tabs { display: flex; border-bottom: 1px solid var(--bd); background: rgba(15,23,42,0.6); overflow-x: auto; }
+.ctab {
+  padding: 11px 18px; font-size: 0.86rem; font-weight: 600; color: var(--muted);
+  border: 0; background: transparent; cursor: pointer; border-bottom: 2px solid transparent;
+}
+.ctab.on { color: #fff; border-bottom-color: var(--acc2); background: rgba(34,211,238,0.06); }
+.code-body { position: relative; padding: 20px; }
+pre {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.86rem; color: #e2e8f0; overflow-x: auto; line-height: 1.65;
+}
+.copy-btn { position: absolute; top: 14px; right: 14px; }
+
+/* Footer */
+footer {
+  border-top: 1px solid var(--bd); padding: 38px 0; margin-top: 40px;
+  text-align: center; color: var(--muted); font-size: 0.88rem;
+}
+footer a { color: #a5b4fc; }
+footer a:hover { text-decoration: underline; }
+
+/* Lightbox */
+.lb {
+  position: fixed; inset: 0; z-index: 90; background: rgba(2,6,23,0.9);
+  display: none; align-items: center; justify-content: center; padding: 24px; cursor: zoom-out;
+}
+.lb.open { display: flex; }
+.lb img { max-width: 96vw; max-height: 92vh; border-radius: 12px; border: 1px solid var(--bd); }
+
+@media (max-width: 900px) {
+  .grid { grid-template-columns: repeat(2, 1fr); }
+  .stats { grid-template-columns: repeat(2, 1fr); }
+  .nav-links { display: none; }
+}
+@media (max-width: 600px) {
+  .grid { grid-template-columns: 1fr; }
+  .hero { padding-top: 48px; }
+}
+</style>
+</head>
+<body>
+<div class="glow"></div>
+
+<header>
+  <div class="wrap nav">
+    <a class="brand" href="#">
+      <img src="logo.svg" alt="DigitalSanDook">
+      <span>DigitalSanDook</span>
+    </a>
+    <nav class="nav-links">
+      <a href="#preview">Screenshots</a>
+      <a href="#benefits">Features</a>
+      <a href="#compare">Compare</a>
+      <a href="#install">Quick Start</a>
+    </nav>
+    <div style="display:flex;gap:10px;align-items:center">
+      <a class="btn sm" href="https://github.com/TinToSer/DigitalSandook" target="_blank" rel="noopener">★ GitHub</a>
+      <a class="btn sm primary" href="https://github.com/TinToSer/DigitalSandook/releases/latest" target="_blank" rel="noopener">Download v1.1.0</a>
+    </div>
+  </div>
+</header>
+
+<main class="wrap">
+  <section class="hero">
+    <div class="pill"><span class="dot"></span> v1.1.0 Released · Pure Go Stdlib · 0 External Dependencies</div>
+    <h1><span class="grad">Your Private File Cloud.</span><br>One ~7 MB Binary.</h1>
+    <p class="lead">
+      Share any folder in seconds. Browse, stream, edit, and transfer files at wire speed with
+      <strong>TOTP 2FA</strong>, <strong>kernel-jailed storage</strong>, <strong>resumable chunked uploads</strong>,
+      <strong>file-drop links</strong>, and a built-in <strong>Cloudflare Tunnel</strong> — no database, no runtime, no bloat.
+    </p>
+    <div class="cta">
+      <a class="btn primary" href="https://github.com/TinToSer/DigitalSandook/releases/latest" target="_blank" rel="noopener">Download Latest Release</a>
+      <a class="btn" href="#install">Quick Install</a>
+      <a class="btn" href="https://github.com/TinToSer/DigitalSandook" target="_blank" rel="noopener">View Source on GitHub</a>
+    </div>
+
+    <div class="stats">
+      <div class="stat"><b>~7 MB</b><span>Single executable</span></div>
+      <div class="stat"><b>0</b><span>Third-party Go deps</span></div>
+      <div class="stat"><b>16</b><span>Pre-built OS/Arch targets</span></div>
+      <div class="stat"><b>TOTP + OS Jail</b><span>Hardened out of the box</span></div>
+    </div>
+  </section>
+
+  <section id="preview" class="showcase" style="padding-top:0">
+    <div class="tabs" id="shotTabs">
+      <button class="tab on" data-shot="0" type="button">Grid &amp; Thumbnails (Dark)</button>
+      <button class="tab" data-shot="1" type="button">Clean List View (Light)</button>
+      <button class="tab" data-shot="2" type="button">Public &amp; File-Drop Links</button>
+      <button class="tab" data-shot="3" type="button">Tamper-Evident Audit Log</button>
+    </div>
+    <div class="frame">
+      <div class="chrome">
+        <i class="r"></i><i class="y"></i><i class="g"></i>
+        <span class="url" id="shotUrl">https://files.example.com/#/Projects</span>
+      </div>
+      <div class="shot-wrap" id="shotWrap">
+        <img id="shotImg" src="screenshots/grid-dark.png" alt="DigitalSanDook Grid View in Dark Mode">
+      </div>
+      <div class="caption">
+        <span id="shotCap">Fast 2-pass server-side photo thumbnails with EXIF rotation, lazy caching, and dark/light/auto themes.</span>
+        <span style="font-size:0.78rem;opacity:0.75">Click image to zoom</span>
+      </div>
+    </div>
+  </section>
+
+  <section id="benefits">
+    <div class="sec-hd">
+      <h2>Engineered to Be the Securest &amp; Fastest</h2>
+      <p>Every layer is designed from first principles — minimal attack surface, maximum throughput, zero setup friction.</p>
+    </div>
+    <div class="grid">
+      <div class="card">
+        <div class="ico">🛡️</div>
+        <h3>Kernel-Enforced Folder Jail</h3>
+        <p>Every file operation runs through Go's <code>os.Root</code> (<code>RESOLVE_BENEATH</code>). Symlinks, junctions, and <code>..</code> traversals are blocked in the kernel — even under race conditions.</p>
+      </div>
+      <div class="card">
+        <div class="ico">🔐</div>
+        <h3>Built-In TOTP 2FA &amp; HMAC Audit</h3>
+        <p>Zero-dependency RFC 6238 authenticator 2FA with replay protection and 8 recovery codes. Every security event is HMAC-SHA256 hash-chained so log tampering is immediately detectable.</p>
+      </div>
+      <div class="card">
+        <div class="ico">⚡</div>
+        <h3>Wire-Speed Resumable Transfers</h3>
+        <p>Parallel resumable chunked uploads with adaptive 8–64 MiB chunks, sparse NTFS allocation, zero-copy <code>sendfile</code> downloads, streamed ZIP archives, and enlarged HTTP/2 windows.</p>
+      </div>
+      <div class="card">
+        <div class="ico">📤</div>
+        <h3>Smart Sharing &amp; File-Drop</h3>
+        <p>Chain-of-trust Viewer/Editor/Owner grants, password + expiry + burn-after-N-uses public links, plus upload-only <strong>File-Drop</strong> links so guests can send you files blindly.</p>
+      </div>
+      <div class="card">
+        <div class="ico">🌐</div>
+        <h3>Isolated Cloudflare Tunnel</h3>
+        <p>Publish share links to the internet with zero port forwarding. The tunnel hits a separate loopback listener exposing <em>only</em> share links — login and admin stay 100% unreachable.</p>
+      </div>
+      <div class="card">
+        <div class="ico">🧰</div>
+        <h3>Recycle Bin, Editor &amp; Checksums</h3>
+        <p>30-day soft-delete Trash with one-click restore, cross-mount copy/move, in-browser text/code/markdown editor with conflict detection, and instant SHA-256 verification.</p>
+      </div>
+    </div>
+  </section>
+
+  <section id="compare">
+    <div class="sec-hd">
+      <h2>How DigitalSanDook Compares</h2>
+      <p>Enterprise-grade security and modern UX without containers of databases, caches, and plugins.</p>
+    </div>
+    <div class="tbl-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Capability</th>
+            <th class="hi-col">DigitalSanDook</th>
+            <th>FileBrowser</th>
+            <th>Nextcloud</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td>Single binary, 0 third-party Go deps</td><td class="hi-col yes">✓ Yes (~7 MB)</td><td>Go + external deps</td><td class="no">✗ PHP + DB + Redis</td></tr>
+          <tr><td>Kernel-enforced <code>os.Root</code> folder jail</td><td class="hi-col yes">✓ Yes</td><td class="no">✗ No</td><td class="no">✗ No</td></tr>
+          <tr><td>Built-in TOTP 2FA + recovery codes</td><td class="hi-col yes">✓ Built-in</td><td class="no">✗ No</td><td>Plugin required</td></tr>
+          <tr><td>Tamper-evident HMAC audit log</td><td class="hi-col yes">✓ Built-in</td><td class="no">✗ No</td><td>Enterprise / app</td></tr>
+          <tr><td>File-Drop &amp; burn-after-N public links</td><td class="hi-col yes">✓ Built-in</td><td class="no">✗ No</td><td class="yes">✓ Yes</td></tr>
+          <tr><td>Adaptive resumable chunked uploads</td><td class="hi-col yes">✓ Built-in</td><td>Basic</td><td class="yes">✓ Yes</td></tr>
+          <tr><td>Isolated links-only Cloudflare Tunnel</td><td class="hi-col yes">✓ Built-in</td><td class="no">✗ No</td><td class="no">✗ No</td></tr>
+          <tr><td>30-day Recycle Bin + In-browser editor</td><td class="hi-col yes">✓ Both</td><td>Editor only</td><td class="yes">✓ Both</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="install">
+    <div class="sec-hd">
+      <h2>Up and Running in 10 Seconds</h2>
+      <p>Pick your favorite way to run. Self-signed HTTPS and a one-time admin password are generated automatically on first start.</p>
+    </div>
+    <div class="code-box">
+      <div class="code-tabs" id="codeTabs">
+        <button class="ctab on" data-code="0" type="button">Linux / macOS</button>
+        <button class="ctab" data-code="1" type="button">Windows (PowerShell)</button>
+        <button class="ctab" data-code="2" type="button">Docker</button>
+        <button class="ctab" data-code="3" type="button">Go Install</button>
+      </div>
+      <div class="code-body">
+        <button class="btn sm copy-btn" id="copyBtn" type="button">Copy</button>
+        <pre id="codePre"></pre>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <div class="wrap">
+    <p><strong>DigitalSanDook</strong> (संदूक / صندوق — "chest") · MIT License · <a href="https://github.com/TinToSer/DigitalSandook">GitHub</a> · <a href="https://github.com/TinToSer/DigitalSandook/releases/latest">Releases</a> · <a href="https://github.com/TinToSer/DigitalSandook/blob/main/SECURITY.md">Security Policy</a></p>
+  </div>
+</footer>
+
+<div class="lb" id="lb"><img id="lbImg" alt=""></div>
+
+<script>
+const shots = [
+  { src: 'screenshots/grid-dark.png', url: 'https://files.example.com/#/Projects', cap: 'Fast 2-pass server-side photo thumbnails with EXIF rotation, lazy caching, and dark/light/auto themes.' },
+  { src: 'screenshots/list-light.png', url: 'https://files.example.com/#/Projects', cap: 'Clean, keyboard-driven list view with multi-select, drag-and-drop move, Trash, and live status bar.' },
+  { src: 'screenshots/share-dark.png', url: 'https://files.example.com/#/Projects (Share)', cap: 'Share with users or create password-protected, expiring, burn-after-N, or upload-only File-Drop links.' },
+  { src: 'screenshots/admin-audit.png', url: 'https://files.example.com/#/Admin/Audit', cap: 'Admin panel with one-click HMAC-SHA256 audit log integrity verification, 2FA management, and live session control.' }
+];
+const snippets = [
+`# Download from GitHub Releases, unpack, and run:
+tar -xzf DigitalSanDook-1.1.0-linux-amd64.tar.gz
+./DigitalSanDook -share Projects=/srv/projects
+
+# Open https://localhost:8443`,
+`# Download Windows archive from GitHub Releases, unzip, and run:
+.\\DigitalSanDook.exe -share Projects=D:\\Projects
+
+# Open https://localhost:8443`,
+`docker run -d --name digitalsandook -p 8443:8443 \\
+  -v dsd-data:/data \\
+  -v /srv/projects:/shares/projects \\
+  ghcr.io/tintoser/digitalsandook:latest -data /data -share Projects=/shares/projects
+
+docker logs digitalsandook   # prints the one-time admin password`,
+`go install github.com/TinToSer/DigitalSandook/cmd/digitalsandook@latest
+digitalsandook -share Projects=/path/to/folder`
+];
+
+const shotImg = document.getElementById('shotImg');
+const shotUrl = document.getElementById('shotUrl');
+const shotCap = document.getElementById('shotCap');
+document.getElementById('shotTabs').addEventListener('click', ev => {
+  const b = ev.target.closest('.tab'); if (!b) return;
+  document.querySelectorAll('#shotTabs .tab').forEach(t => t.classList.remove('on'));
+  b.classList.add('on');
+  const s = shots[+b.dataset.shot];
+  shotImg.src = s.src; shotUrl.textContent = s.url; shotCap.textContent = s.cap;
+});
+
+const lb = document.getElementById('lb'), lbImg = document.getElementById('lbImg');
+document.getElementById('shotWrap').addEventListener('click', () => { lbImg.src = shotImg.src; lb.classList.add('open'); });
+lb.addEventListener('click', () => lb.classList.remove('open'));
+document.addEventListener('keydown', ev => { if (ev.key === 'Escape') lb.classList.remove('open'); });
+
+const codePre = document.getElementById('codePre'), copyBtn = document.getElementById('copyBtn');
+let curCode = 0;
+function showCode(i) { curCode = i; codePre.textContent = snippets[i]; }
+document.getElementById('codeTabs').addEventListener('click', ev => {
+  const b = ev.target.closest('.ctab'); if (!b) return;
+  document.querySelectorAll('#codeTabs .ctab').forEach(t => t.classList.remove('on'));
+  b.classList.add('on'); showCode(+b.dataset.code);
+});
+copyBtn.addEventListener('click', async () => {
+  try { await navigator.clipboard.writeText(snippets[curCode]); copyBtn.textContent = 'Copied!'; setTimeout(() => copyBtn.textContent = 'Copy', 1500); } catch (_) {}
+});
+showCode(0);
+</script>
+</body>
+</html>
