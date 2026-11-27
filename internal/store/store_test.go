@@ -177,3 +177,14 @@ func TestLinkHitsAreFlushed(t *testing.T) {
 		t.Fatalf("hits after reopen = %d, want 2", l.Hits)
 	}
 }
+
+func TestLinkMaxHitsEnforced(t *testing.T) {
+	s := testStore(t)
+	s.PutLink(Link{Token: "burn", Mount: "docs", Path: "/", MaxHits: 2})
+	if !s.HitLink("burn") || !s.HitLink("burn") {
+		t.Fatal("first two hits should succeed")
+	}
+	if s.HitLink("burn") {
+		t.Fatal("third hit exceeded MaxHits=2")
+	}
+}

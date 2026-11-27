@@ -5,8 +5,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"net/http"
+	"os"
 	"path"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -16,6 +19,8 @@ import (
 	"github.com/TinToSer/DigitalSandook/internal/randx"
 	"github.com/TinToSer/DigitalSandook/internal/store"
 )
+
+const maxDropUploadSize = 100 << 20 // 100 MiB per file on anonymous file-drop links
 
 // ---------- user-to-user grants ----------
 
@@ -92,7 +97,7 @@ func (a *App) hGrantSet(w http.ResponseWriter, r *http.Request, c *Ctx) {
 	}
 	if !c.User.Admin && lvl < store.LvlOwner {
 		for _, g := range a.store.Grants() {
-			if g.Mount == in.Mount && g.Path == rel && g.User == in.User && g.By != c.User.Name {
+			if g.Mount == in.Mount && store.PathEqual(g.Path, rel) && g.User == in.User && g.By != c.User.Name {
 				jerr(w, 403, "this person's access was set by someone else")
 				return
 			}
@@ -130,18 +135,20 @@ func (a *App) hGrantDelete(w http.ResponseWriter, r *http.Request, c *Ctx) {
 // ---------- public links ----------
 
 type linkView struct {
-	Token     string `json:"token"`
-	Mount     string `json:"mount"`
-	Path      string `json:"path"`
-	Owner     string `json:"owner"`
-	Created   int64  `json:"created"`
-	Expires   int64  `json:"expires"`
-	Protected bool   `json:"protected"`
-	Hits      int    `json:"hits"`
+	Token      string `json:"token"`
+	Mount      string `json:"mount"`
+	Path       string `json:"path"`
+	Owner      string `json:"owner"`
+	Created    int64  `json:"created"`
+	Expires    int64  `json:"expires"`
+	Protected  bool   `json:"protected"`
+	Hits       int    `json:"hits"`
+	MaxHits    int    `json:"maxHits,omitempty"`
+	UploadOnly bool   `json:"uploadOnly,omitempty"`
 }
 
 func toLinkView(l store.Link) linkView {
-	return linkView{l.Token, l.Mount, l.Path, l.Owner, l.Created.Unix(), l.Expires, l.PassHash != "", l.Hits}
+	return linkView{l.Token, l.Mount, l.Path, l.Owner, l.Created.Unix(), l.Expires, l.PassHash != "", l.Hits, l.MaxHits, l.UploadOnly}
 }
 
 func (a *App) hLinksGet(w http.ResponseWriter, r *http.Request, c *Ctx) {
@@ -157,7 +164,7 @@ func (a *App) hLinksGet(w http.ResponseWriter, r *http.Request, c *Ctx) {
 	}
 	out := []linkView{}
 	for _, l := range a.store.Links() {
-		if l.Mount == q.Get("m") && l.Path == rel {
+		if l.Mount == q.Get("m") && store.PathEqual(l.Path, rel) {
 			out = append(out, toLinkView(l))
 		}
 	}
@@ -168,6 +175,8 @@ func (a *App) hLinkCreate(w http.ResponseWriter, r *http.Request, c *Ctx) {
 	var in struct {
 		Mount, Path, Password string
 		Days                  int
+		MaxHits               int
+		UploadOnly            bool
 	}
 	if !readJSON(w, r, &in) {
 		return
@@ -181,11 +190,30 @@ func (a *App) hLinkCreate(w http.ResponseWriter, r *http.Request, c *Ctx) {
 		jerr(w, 403, "you cannot share this")
 		return
 	}
-	if in.Days < 0 || in.Days > 3650 || len(in.Password) > 256 {
+	if in.Days < 0 || in.Days > 3650 || in.MaxHits < 0 || in.MaxHits > 1_000_000 || len(in.Password) > 256 {
 		jerr(w, 400, "invalid options")
 		return
 	}
-	l := store.Link{Token: randx.Token(24), Mount: in.Mount, Path: rel, Owner: c.User.Name, Created: time.Now()}
+	if in.UploadOnly {
+		m, _ := a.store.Mount(in.Mount)
+		if m.ReadOnly {
+			jerr(w, 400, "cannot create a file-drop link on a read-only folder")
+			return
+		}
+		root, err := a.root(m)
+		if err != nil {
+			jerr(w, 503, "shared folder is unavailable")
+			return
+		}
+		if st, err := root.Stat(fsjail.OSPath(rel)); err != nil || !st.IsDir() {
+			jerr(w, 400, "file-drop links can only target a folder")
+			return
+		}
+	}
+	l := store.Link{
+		Token: randx.Token(24), Mount: in.Mount, Path: rel, Owner: c.User.Name,
+		Created: time.Now(), MaxHits: in.MaxHits, UploadOnly: in.UploadOnly,
+	}
 	if in.Days > 0 {
 		l.Expires = time.Now().Add(time.Duration(in.Days) * 24 * time.Hour).Unix()
 	}
@@ -205,7 +233,7 @@ func (a *App) hLinkCreate(w http.ResponseWriter, r *http.Request, c *Ctx) {
 		jerr(w, 500, "could not save")
 		return
 	}
-	a.auditf(c, "link-create", "%s:%s", in.Mount, rel)
+	a.auditf(c, "link-create", "%s:%s uploadOnly=%v maxHits=%d", in.Mount, rel, l.UploadOnly, l.MaxHits)
 	writeJSON(w, 200, toLinkView(l))
 }
 
@@ -270,20 +298,32 @@ func (a *App) unlocked(r *http.Request, l store.Link) bool {
 
 func unlockCookie(token string) string { return "dsd_l_" + token[:min(8, len(token))] }
 
+func (a *App) pubSameOrigin(r *http.Request) bool {
+	if viaTunnel(r) {
+		sf := r.Header.Get("Sec-Fetch-Site")
+		return sf == "" || sf == "same-origin" || sf == "none"
+	}
+	return a.sameOrigin(r)
+}
+
 type pubHandler func(w http.ResponseWriter, r *http.Request, l store.Link, m store.Mount, c *Ctx)
 
-// pub resolves a share link, enforces expiry/owner validity, and (unless
-// open=true) the link password.
+// pub resolves a share link, enforces expiry/max-hits/owner validity, and
+// (unless open=true) the link password.
 func (a *App) pub(h pubHandler, open bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		l, ok := a.store.Link(r.PathValue("token"))
-		if !ok || (l.Expires > 0 && time.Now().Unix() > l.Expires) {
+		if !ok || (l.Expires > 0 && time.Now().Unix() > l.Expires) || (l.MaxHits > 0 && l.Hits >= l.MaxHits) {
 			jerr(w, 404, "this link is invalid or has expired")
 			return
 		}
 		owner, ok := a.store.User(l.Owner)
 		m, mok := a.store.Mount(l.Mount)
-		if !ok || !mok || owner.Disabled || a.store.Level(owner, l.Mount, l.Path) < store.LvlRead {
+		needLvl := store.LvlRead
+		if l.UploadOnly {
+			needLvl = store.LvlWrite
+		}
+		if !ok || !mok || owner.Disabled || a.store.Level(owner, l.Mount, l.Path) < needLvl {
 			jerr(w, 404, "this link is invalid or has expired")
 			return
 		}
@@ -296,6 +336,11 @@ func (a *App) pub(h pubHandler, open bool) http.HandlerFunc {
 }
 
 func (a *App) hPubInfo(w http.ResponseWriter, r *http.Request, l store.Link, m store.Mount, c *Ctx) {
+	// Never leak filename, directory status or expiry before the password is verified
+	if !a.unlocked(r, l) {
+		writeJSON(w, 200, map[string]any{"needsPassword": true, "uploadOnly": l.UploadOnly})
+		return
+	}
 	isDir := false
 	if root, err := a.root(m); err == nil {
 		if st, err := root.Stat(fsjail.OSPath(l.Path)); err == nil {
@@ -306,12 +351,15 @@ func (a *App) hPubInfo(w http.ResponseWriter, r *http.Request, l store.Link, m s
 	if l.Path == "/" {
 		name = m.Name
 	}
-	writeJSON(w, 200, map[string]any{"name": name, "isDir": isDir, "needsPassword": !a.unlocked(r, l), "expires": l.Expires})
+	writeJSON(w, 200, map[string]any{
+		"name": name, "isDir": isDir, "needsPassword": false,
+		"expires": l.Expires, "uploadOnly": l.UploadOnly,
+		"hits": l.Hits, "maxHits": l.MaxHits,
+	})
 }
 
 func (a *App) hPubUnlock(w http.ResponseWriter, r *http.Request, l store.Link, m store.Mount, c *Ctx) {
-	// cloudflared may rewrite Host, so behind the tunnel rely on Fetch Metadata
-	if (viaTunnel(r) && r.Header.Get("Sec-Fetch-Site") == "cross-site") || (!viaTunnel(r) && !sameOrigin(r)) {
+	if !a.pubSameOrigin(r) {
 		jerr(w, 403, "request rejected")
 		return
 	}
@@ -323,8 +371,10 @@ func (a *App) hPubUnlock(w http.ResponseWriter, r *http.Request, l store.Link, m
 	if !readJSON(w, r, &in) {
 		return
 	}
-	key := "lp:" + c.IP + ":" + l.Token
-	if d := a.lim.Wait(key); d > 0 {
+	ipKey := "lp:" + c.IP + ":" + l.Token
+	tokKey := "lpt:" + l.Token
+	if d := max(a.lim.Wait(ipKey), a.lim.Wait(tokKey)); d > 0 {
+		w.Header().Set("Retry-After", strconv.Itoa(int(d.Seconds())+1))
 		jerr(w, 429, "too many attempts, try again later")
 		return
 	}
@@ -335,13 +385,17 @@ func (a *App) hPubUnlock(w http.ResponseWriter, r *http.Request, l store.Link, m
 	good := len(in.Password) <= 1024 && auth.VerifyPassword(in.Password, l.PassHash)
 	release()
 	if !good {
-		a.lim.Fail(key, 5, 30*time.Second, 15*time.Minute)
+		a.lim.Fail(ipKey, 5, 30*time.Second, 15*time.Minute)
+		a.lim.Fail(tokKey, 30, 15*time.Second, 10*time.Minute)
 		jerr(w, 403, "wrong password")
 		return
 	}
+	a.lim.Reset(ipKey)
 	exp := time.Now().Add(unlockTTL).Unix()
-	http.SetCookie(w, &http.Cookie{Name: unlockCookie(l.Token), Value: a.unlockValue(l, exp), Path: "/api/public/" + l.Token,
-		MaxAge: int(unlockTTL.Seconds()), HttpOnly: true, Secure: a.isSecure(r), SameSite: http.SameSiteStrictMode})
+	http.SetCookie(w, &http.Cookie{
+		Name: unlockCookie(l.Token), Value: a.unlockValue(l, exp), Path: "/api/public/" + l.Token,
+		MaxAge: int(unlockTTL.Seconds()), HttpOnly: true, Secure: a.isSecure(r), SameSite: http.SameSiteStrictMode,
+	})
 	writeOK(w)
 }
 
@@ -361,12 +415,20 @@ func (a *App) pubTarget(w http.ResponseWriter, r *http.Request, l store.Link, m 
 }
 
 func (a *App) hPubList(w http.ResponseWriter, r *http.Request, l store.Link, m store.Mount, c *Ctx) {
+	if l.UploadOnly {
+		jerr(w, 403, "this link is upload-only")
+		return
+	}
 	if t := a.pubTarget(w, r, l, m); t != nil {
 		listFolder(w, r, t, nil)
 	}
 }
 
 func (a *App) hPubDownload(w http.ResponseWriter, r *http.Request, l store.Link, m store.Mount, c *Ctx) {
+	if l.UploadOnly {
+		jerr(w, 403, "this link is upload-only")
+		return
+	}
 	t := a.pubTarget(w, r, l, m)
 	if t == nil {
 		return
@@ -377,24 +439,102 @@ func (a *App) hPubDownload(w http.ResponseWriter, r *http.Request, l store.Link,
 	}
 	defer f.Close()
 	if firstRequest(r) {
-		a.store.HitLink(l.Token)
+		if !a.store.HitLink(l.Token) {
+			jerr(w, 404, "this link has reached its download limit")
+			return
+		}
 		a.aud.Write(c.User.Name, c.IP, "link-download", t.m.Name+":"+t.rel)
 	}
 	serveFile(w, r, f, st, path.Base(t.rel), false)
 }
 
 func (a *App) hPubZip(w http.ResponseWriter, r *http.Request, l store.Link, m store.Mount, c *Ctx) {
+	if l.UploadOnly {
+		jerr(w, 403, "this link is upload-only")
+		return
+	}
 	t := a.pubTarget(w, r, l, m)
 	if t == nil {
 		return
 	}
+	// Isolated semaphore so anonymous visitors cannot starve authenticated users
 	select {
-	case a.zipSem <- struct{}{}:
-		defer func() { <-a.zipSem }()
+	case a.pubZipSem <- struct{}{}:
+		defer func() { <-a.pubZipSem }()
 	default:
 		jerr(w, 429, "busy, try again")
 		return
 	}
-	a.store.HitLink(l.Token)
+	if !a.store.HitLink(l.Token) {
+		jerr(w, 404, "this link has reached its download limit")
+		return
+	}
 	a.streamZip(w, r, c, t, r.URL.Query()["n"])
+}
+
+// hPubUpload accepts anonymous file drops on an UploadOnly share link.
+// Files are always renamed on conflict (never overwrite existing files).
+func (a *App) hPubUpload(w http.ResponseWriter, r *http.Request, l store.Link, m store.Mount, c *Ctx) {
+	if !l.UploadOnly {
+		jerr(w, 403, "uploads are not allowed on this link")
+		return
+	}
+	if !a.pubSameOrigin(r) {
+		jerr(w, 403, "request rejected")
+		return
+	}
+	name := r.URL.Query().Get("name")
+	if !fsjail.ValidNewName(name) {
+		jerr(w, 400, "invalid file name")
+		return
+	}
+	if r.ContentLength > maxDropUploadSize {
+		jerr(w, 413, "file exceeds upload limit (100 MB)")
+		return
+	}
+	root, err := a.root(m)
+	if err != nil {
+		jerr(w, 503, "unavailable")
+		return
+	}
+	if st, err := root.Stat(fsjail.OSPath(l.Path)); err != nil || !st.IsDir() {
+		jerr(w, 400, "target is not a folder")
+		return
+	}
+	if !a.store.HitLink(l.Token) {
+		jerr(w, 404, "this link has reached its upload limit")
+		return
+	}
+	if err := fsjail.EnsureTmp(root); err != nil {
+		fsErr(w, err)
+		return
+	}
+	tmp := filepath.Join(fsjail.TmpDir, randx.Token(12)+".part")
+	f, err := root.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		fsErr(w, err)
+		return
+	}
+	n, err := fsjail.CopyBuffered(f, io.LimitReader(bodyReader(w, r), maxDropUploadSize+1))
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		root.Remove(tmp)
+		jerr(w, 400, "upload interrupted")
+		return
+	}
+	if n > maxDropUploadSize {
+		root.Remove(tmp)
+		jerr(w, 413, "file exceeds upload limit (100 MB)")
+		return
+	}
+	final, err := fsjail.Place(root, tmp, l.Path, name, "rename")
+	if err != nil {
+		root.Remove(tmp)
+		fsErr(w, err)
+		return
+	}
+	a.aud.Write(c.User.Name, c.IP, "link-upload", fmt.Sprintf("%s:%s (%d bytes)", m.Name, fsjail.Join(l.Path, final), n))
+	writeJSON(w, 200, map[string]any{"name": final})
 }

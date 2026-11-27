@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"sync"
 	"time"
 )
 
@@ -33,9 +34,18 @@ func Supported(ext string) bool { return exts[ext] }
 
 var ErrNoThumb = errors.New("no thumbnail")
 
+var readerPool = sync.Pool{New: func() any { return bufio.NewReaderSize(nil, 256<<10) }}
+
 // Make decodes an image and returns a JPEG thumbnail, upright per EXIF.
 func Make(f io.ReadSeeker, ext string) ([]byte, error) {
-	cfg, _, err := image.DecodeConfig(bufio.NewReader(f))
+	br := readerPool.Get().(*bufio.Reader)
+	defer func() {
+		br.Reset(nil)
+		readerPool.Put(br)
+	}()
+
+	br.Reset(f)
+	cfg, _, err := image.DecodeConfig(br)
 	if err != nil {
 		return nil, err
 	}
@@ -47,25 +57,47 @@ func Make(f io.ReadSeeker, ext string) ([]byte, error) {
 		if _, err := f.Seek(0, io.SeekStart); err != nil {
 			return nil, err
 		}
-		orient = jpegOrientation(io.LimitReader(f, 256<<10))
+		br.Reset(io.LimitReader(f, 256<<10))
+		orient = jpegOrientation(br)
 	}
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
 		return nil, err
 	}
-	src, _, err := image.Decode(bufio.NewReaderSize(f, 1<<20))
+	br.Reset(f)
+	src, _, err := image.Decode(br)
 	if err != nil {
 		return nil, err
 	}
 	dst := orientImage(downscale(src, Edge), orient)
-	var buf bytes.Buffer
-	if err := jpeg.Encode(&buf, dst, &jpeg.Options{Quality: 80}); err != nil {
+	buf := bytes.NewBuffer(make([]byte, 0, 16<<10))
+	if err := jpeg.Encode(buf, dst, &jpeg.Options{Quality: 80}); err != nil {
 		return nil, err
 	}
 	return buf.Bytes(), nil
 }
 
-// downscale shrinks src so its longest edge is at most edge, averaging a 3x3
-// grid of samples per output pixel. Transparency is flattened onto white.
+func clampByte(v int32) uint8 {
+	if v < 0 {
+		return 0
+	}
+	if v > 255 {
+		return 255
+	}
+	return uint8(v)
+}
+
+func ycbcrToRGB(y, cb, cr uint8) (uint8, uint8, uint8) {
+	yy1 := int32(y) * 0x10101
+	cb1 := int32(cb) - 128
+	cr1 := int32(cr) - 128
+	return clampByte((yy1 + 91881*cr1) >> 16),
+		clampByte((yy1 - 22554*cb1 - 46802*cr1) >> 16),
+		clampByte((yy1 + 116130*cb1) >> 16)
+}
+
+// downscale shrinks src so its longest edge is at most edge using a fast
+// two-pass separable area-averaging (box) filter with direct pixel-slice fast
+// paths (zero interface dispatch per pixel). Transparency is flattened onto white.
 func downscale(src image.Image, edge int) *image.RGBA {
 	b := src.Bounds()
 	sw, sh := b.Dx(), b.Dy()
@@ -77,29 +109,205 @@ func downscale(src image.Image, edge int) *image.RGBA {
 			dw, dh = max(1, sw*edge/sh), edge
 		}
 	}
+
+	// Pass 1: horizontal downscale (sw x sh -> dw x sh, 3 bytes RGB per pixel)
+	tmp := make([]uint8, dw*sh*3)
+	xStarts := make([]int, dw)
+	xEnds := make([]int, dw)
+	for x := 0; x < dw; x++ {
+		x0 := x * sw / dw
+		x1 := (x + 1) * sw / dw
+		if x1 <= x0 {
+			x1 = min(sw, x0+1)
+		}
+		xStarts[x] = x0
+		xEnds[x] = x1
+	}
+
+	switch im := src.(type) {
+	case *image.YCbCr:
+		horizYCbCr(im, b, dw, sh, xStarts, xEnds, tmp)
+	case *image.RGBA:
+		horizRGBA(im, b, dw, sh, xStarts, xEnds, tmp)
+	case *image.NRGBA:
+		horizNRGBA(im, b, dw, sh, xStarts, xEnds, tmp)
+	case *image.Paletted:
+		horizPaletted(im, b, dw, sh, xStarts, xEnds, tmp)
+	default:
+		horizGeneric(src, b, dw, sh, xStarts, xEnds, tmp)
+	}
+
+	// Pass 2: vertical downscale (dw x sh -> dw x dh into *image.RGBA)
 	dst := image.NewRGBA(image.Rect(0, 0, dw, dh))
-	const n = 3
+	rowStride := dw * 3
 	for y := 0; y < dh; y++ {
+		y0 := y * sh / dh
+		y1 := (y + 1) * sh / dh
+		if y1 <= y0 {
+			y1 = min(sh, y0+1)
+		}
+		cnt := uint32(y1 - y0)
+		dstRow := dst.Pix[y*dst.Stride:]
 		for x := 0; x < dw; x++ {
-			var sr, sg, sb uint64
-			for j := 0; j < n; j++ {
-				sy := b.Min.Y + min(sh-1, (y*n+j)*sh/(dh*n))
-				for i := 0; i < n; i++ {
-					sx := b.Min.X + min(sw-1, (x*n+i)*sw/(dw*n))
-					r, g, bl, al := src.At(sx, sy).RGBA()
-					sr += uint64(r + 0xffff - al)
-					sg += uint64(g + 0xffff - al)
-					sb += uint64(bl + 0xffff - al)
-				}
+			var sr, sg, sb uint32
+			col := x * 3
+			for sy := y0; sy < y1; sy++ {
+				o := sy*rowStride + col
+				sr += uint32(tmp[o])
+				sg += uint32(tmp[o+1])
+				sb += uint32(tmp[o+2])
 			}
-			o := dst.PixOffset(x, y)
-			dst.Pix[o] = uint8(sr / (n * n) >> 8)
-			dst.Pix[o+1] = uint8(sg / (n * n) >> 8)
-			dst.Pix[o+2] = uint8(sb / (n * n) >> 8)
-			dst.Pix[o+3] = 0xff
+			do := x * 4
+			dstRow[do] = uint8(sr / cnt)
+			dstRow[do+1] = uint8(sg / cnt)
+			dstRow[do+2] = uint8(sb / cnt)
+			dstRow[do+3] = 0xff
 		}
 	}
 	return dst
+}
+
+func horizYCbCr(im *image.YCbCr, b image.Rectangle, dw, sh int, xStarts, xEnds []int, tmp []uint8) {
+	for y := 0; y < sh; y++ {
+		sy := b.Min.Y + y
+		yRowOff := (sy - im.Rect.Min.Y) * im.YStride
+		cRowIdx := sy - im.Rect.Min.Y
+		switch im.SubsampleRatio {
+		case image.YCbCrSubsampleRatio420, image.YCbCrSubsampleRatio440:
+			cRowIdx >>= 1
+		}
+		cRowOff := cRowIdx * im.CStride
+		dstRow := tmp[y*dw*3:]
+		for x := 0; x < dw; x++ {
+			x0, x1 := xStarts[x], xEnds[x]
+			var sr, sg, sb uint32
+			for sx := x0; sx < x1; sx++ {
+				ix := b.Min.X + sx - im.Rect.Min.X
+				yi := yRowOff + ix
+				ci := cRowOff
+				switch im.SubsampleRatio {
+				case image.YCbCrSubsampleRatio444, image.YCbCrSubsampleRatio440:
+					ci += ix
+				case image.YCbCrSubsampleRatio422, image.YCbCrSubsampleRatio420:
+					ci += ix >> 1
+				case image.YCbCrSubsampleRatio411, image.YCbCrSubsampleRatio410:
+					ci += ix >> 2
+				}
+				r, g, bl := ycbcrToRGB(im.Y[yi], im.Cb[ci], im.Cr[ci])
+				sr += uint32(r)
+				sg += uint32(g)
+				sb += uint32(bl)
+			}
+			cnt := uint32(x1 - x0)
+			o := x * 3
+			dstRow[o] = uint8(sr / cnt)
+			dstRow[o+1] = uint8(sg / cnt)
+			dstRow[o+2] = uint8(sb / cnt)
+		}
+	}
+}
+
+func horizRGBA(im *image.RGBA, b image.Rectangle, dw, sh int, xStarts, xEnds []int, tmp []uint8) {
+	for y := 0; y < sh; y++ {
+		srcRow := im.Pix[(b.Min.Y+y-im.Rect.Min.Y)*im.Stride:]
+		xBase := (b.Min.X - im.Rect.Min.X) * 4
+		dstRow := tmp[y*dw*3:]
+		for x := 0; x < dw; x++ {
+			x0, x1 := xStarts[x], xEnds[x]
+			var sr, sg, sb uint32
+			for sx := x0; sx < x1; sx++ {
+				p := xBase + sx*4
+				// RGBA is alpha-premultiplied; flatten onto white (255 - a)
+				inv := uint32(255 - srcRow[p+3])
+				sr += uint32(srcRow[p]) + inv
+				sg += uint32(srcRow[p+1]) + inv
+				sb += uint32(srcRow[p+2]) + inv
+			}
+			cnt := uint32(x1 - x0)
+			o := x * 3
+			dstRow[o] = uint8(sr / cnt)
+			dstRow[o+1] = uint8(sg / cnt)
+			dstRow[o+2] = uint8(sb / cnt)
+		}
+	}
+}
+
+func horizNRGBA(im *image.NRGBA, b image.Rectangle, dw, sh int, xStarts, xEnds []int, tmp []uint8) {
+	for y := 0; y < sh; y++ {
+		srcRow := im.Pix[(b.Min.Y+y-im.Rect.Min.Y)*im.Stride:]
+		xBase := (b.Min.X - im.Rect.Min.X) * 4
+		dstRow := tmp[y*dw*3:]
+		for x := 0; x < dw; x++ {
+			x0, x1 := xStarts[x], xEnds[x]
+			var sr, sg, sb uint32
+			for sx := x0; sx < x1; sx++ {
+				p := xBase + sx*4
+				a := uint32(srcRow[p+3])
+				inv := 255 - a
+				sr += (uint32(srcRow[p])*a)/255 + inv
+				sg += (uint32(srcRow[p+1])*a)/255 + inv
+				sb += (uint32(srcRow[p+2])*a)/255 + inv
+			}
+			cnt := uint32(x1 - x0)
+			o := x * 3
+			dstRow[o] = uint8(sr / cnt)
+			dstRow[o+1] = uint8(sg / cnt)
+			dstRow[o+2] = uint8(sb / cnt)
+		}
+	}
+}
+
+func horizPaletted(im *image.Paletted, b image.Rectangle, dw, sh int, xStarts, xEnds []int, tmp []uint8) {
+	var pal [256][3]uint8
+	for i, c := range im.Palette {
+		if i >= 256 {
+			break
+		}
+		r, g, bl, al := c.RGBA()
+		pal[i] = [3]uint8{uint8((r + 0xffff - al) >> 8), uint8((g + 0xffff - al) >> 8), uint8((bl + 0xffff - al) >> 8)}
+	}
+	for y := 0; y < sh; y++ {
+		srcRow := im.Pix[(b.Min.Y+y-im.Rect.Min.Y)*im.Stride:]
+		xBase := b.Min.X - im.Rect.Min.X
+		dstRow := tmp[y*dw*3:]
+		for x := 0; x < dw; x++ {
+			x0, x1 := xStarts[x], xEnds[x]
+			var sr, sg, sb uint32
+			for sx := x0; sx < x1; sx++ {
+				c := pal[srcRow[xBase+sx]]
+				sr += uint32(c[0])
+				sg += uint32(c[1])
+				sb += uint32(c[2])
+			}
+			cnt := uint32(x1 - x0)
+			o := x * 3
+			dstRow[o] = uint8(sr / cnt)
+			dstRow[o+1] = uint8(sg / cnt)
+			dstRow[o+2] = uint8(sb / cnt)
+		}
+	}
+}
+
+func horizGeneric(src image.Image, b image.Rectangle, dw, sh int, xStarts, xEnds []int, tmp []uint8) {
+	for y := 0; y < sh; y++ {
+		sy := b.Min.Y + y
+		dstRow := tmp[y*dw*3:]
+		for x := 0; x < dw; x++ {
+			x0, x1 := xStarts[x], xEnds[x]
+			var sr, sg, sb uint64
+			for sx := x0; sx < x1; sx++ {
+				r, g, bl, al := src.At(b.Min.X+sx, sy).RGBA()
+				sr += uint64(r + 0xffff - al)
+				sg += uint64(g + 0xffff - al)
+				sb += uint64(bl + 0xffff - al)
+			}
+			cnt := uint64(x1 - x0)
+			o := x * 3
+			dstRow[o] = uint8((sr / cnt) >> 8)
+			dstRow[o+1] = uint8((sg / cnt) >> 8)
+			dstRow[o+2] = uint8((sb / cnt) >> 8)
+		}
+	}
 }
 
 // orientImage applies an EXIF orientation (1-8) so phone photos stand upright.
@@ -140,7 +348,10 @@ func orientImage(src *image.RGBA, o int) *image.RGBA {
 
 // jpegOrientation reads the EXIF orientation tag from a JPEG's APP1 segment.
 func jpegOrientation(r io.Reader) int {
-	br := bufio.NewReader(r)
+	br, ok := r.(*bufio.Reader)
+	if !ok {
+		br = bufio.NewReader(r)
+	}
 	var soi [2]byte
 	if _, err := io.ReadFull(br, soi[:]); err != nil || soi != [2]byte{0xFF, 0xD8} {
 		return 1

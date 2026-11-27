@@ -5,13 +5,22 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"io/fs"
 	"log"
 	"net/http"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
+
+var gzipPool = sync.Pool{
+	New: func() any {
+		zw, _ := gzip.NewWriterLevel(io.Discard, gzip.BestSpeed)
+		return zw
+	},
+}
 
 func writeJSON(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -37,9 +46,12 @@ func writeJSONz(w http.ResponseWriter, r *http.Request, code int, v any) {
 	}
 	h.Set("Content-Encoding", "gzip")
 	w.WriteHeader(code)
-	zw, _ := gzip.NewWriterLevel(w, gzip.BestSpeed)
-	zw.Write(b)
-	zw.Close()
+	zw := gzipPool.Get().(*gzip.Writer)
+	zw.Reset(w)
+	_, _ = zw.Write(b)
+	_ = zw.Close()
+	zw.Reset(io.Discard)
+	gzipPool.Put(zw)
 }
 
 func jerr(w http.ResponseWriter, code int, msg string) {

@@ -209,19 +209,25 @@ function showLogin(msg) {
   const err = h('div', { class: 'err' }, msg || '');
   const user = h('input', { type: 'text', autocomplete: 'username', autocapitalize: 'none', spellcheck: 'false', placeholder: 'Username' });
   const pass = h('input', { type: 'password', autocomplete: 'current-password', placeholder: 'Password' });
+  const totp = h('input', { type: 'text', autocomplete: 'one-time-code', inputmode: 'numeric', placeholder: '6-digit code or recovery code', class: 'mono' });
+  const totpBox = h('div', { class: 'hide' }, h('label', { class: 'f' }, 'Two-factor authentication code'), totp);
   const go = h('button', { class: 'btn primary', type: 'submit', style: null }, 'Sign in');
   const form = h('form', { onsubmit: async ev => {
     ev.preventDefault(); err.textContent = ''; go.disabled = true;
     try {
-      const r = await api('POST', '/api/login', { username: user.value, password: pass.value });
+      const r = await api('POST', '/api/login', { username: user.value, password: pass.value, totp: totp.value });
+      if (r.needs2fa) {
+        totpBox.classList.remove('hide'); totp.focus(); go.disabled = false; return;
+      }
       S.csrf = r.csrf; await boot();
-    } catch (e) { err.textContent = e.message; pass.value = ''; pass.focus(); }
+    } catch (e) { err.textContent = e.message; if (totpBox.classList.contains('hide')) { pass.value = ''; pass.focus(); } else { totp.value = ''; totp.focus(); } }
     go.disabled = false;
   } },
     h('div', { class: 'brand' }, h('img', { src: '/static/logo.svg', alt: '' }), 'DigitalSanDook'),
     h('p', { class: 'muted' }, 'Sign in to access your files'),
     h('label', { class: 'f' }, 'Username'), user,
     h('label', { class: 'f' }, 'Password'), pass,
+    totpBox,
     err,
     h('div', { class: 'row' }, go));
   go.classList.add('grow');
@@ -265,10 +271,57 @@ function buildShell() {
 
 function userMenu(ev) {
   const r = ev.currentTarget.getBoundingClientRect();
-  showMenu(r.right - 190, r.bottom + 4, [
+  showMenu(r.right - 210, r.bottom + 4, [
     { icon: 'key', label: 'Change password', fn: () => changePassword(false) },
+    { icon: 'shield', label: S.me.has2fa ? 'Two-factor auth (ON)' : 'Enable 2FA', fn: open2FA },
     { icon: 'logout', label: 'Sign out', fn: async () => { try { await api('POST', '/api/logout'); } catch (_) {} S.me = null; location.hash = ''; showLogin(); } },
   ]);
+}
+
+async function open2FA() {
+  if (S.me.has2fa) {
+    const pw = h('input', { type: 'password', autocomplete: 'current-password' });
+    const code = h('input', { type: 'text', autocomplete: 'one-time-code', placeholder: '6-digit code or recovery code', class: 'mono' });
+    const err = h('div', { class: 'err' });
+    let mm;
+    const go = async () => {
+      err.textContent = '';
+      try { await api('POST', '/api/2fa/disable', { password: pw.value, code: code.value }); S.me.has2fa = false; toast('2FA disabled'); mm.close(); }
+      catch (e) { err.textContent = e.message; }
+    };
+    mm = modal('Two-factor authentication', [
+      h('p', { class: 'muted' }, '2FA is currently enabled on your account.'),
+      h('label', { class: 'f' }, 'Current password'), pw,
+      h('label', { class: 'f' }, 'Authenticator or recovery code'), code, err],
+      { footer: close => [btn(null, 'Cancel', () => close()), btn(null, 'Disable 2FA', go, 'primary danger')] });
+    return;
+  }
+  let setup;
+  try { setup = await api('POST', '/api/2fa/setup'); } catch (e) { return fail(e); }
+  const pw = h('input', { type: 'password', autocomplete: 'current-password' });
+  const code = h('input', { type: 'text', autocomplete: 'one-time-code', inputmode: 'numeric', placeholder: '6-digit code from app', class: 'mono' });
+  const err = h('div', { class: 'err' });
+  let mm;
+  const go = async () => {
+    err.textContent = '';
+    try {
+      const r = await api('POST', '/api/2fa/enable', { password: pw.value, secret: setup.secret, code: code.value });
+      S.me.has2fa = true; mm.close();
+      modal('Save your recovery codes', [
+        h('p', { class: 'muted' }, 'Store these single-use recovery codes somewhere safe. Each code works once if you lose your authenticator device.'),
+        h('pre', { class: 'mono' }, r.recoveryCodes.join('\n'))],
+        { sticky: true, footer: close => [
+          btn('copy', 'Copy codes', async () => { try { await navigator.clipboard.writeText(r.recoveryCodes.join('\n')); toast('Copied'); } catch (_) {} }),
+          btn(null, 'I saved them', () => close(), 'primary')] });
+    } catch (e) { err.textContent = e.message; }
+  };
+  mm = modal('Enable two-factor authentication', [
+    h('p', { class: 'muted' }, 'Add this secret key to your authenticator app (Google Authenticator, Authy, 1Password, Bitwarden):'),
+    h('div', { class: 'copybox' }, h('input', { type: 'text', readonly: true, value: setup.secret, class: 'mono', onfocus: ev => ev.target.select() }),
+      btn('copy', 'Copy', async () => { try { await navigator.clipboard.writeText(setup.secret); toast('Copied'); } catch (_) {} }, 'sm')),
+    h('label', { class: 'f' }, 'Current password'), pw,
+    h('label', { class: 'f' }, '6-digit verification code'), code, err],
+    { footer: close => [btn(null, 'Cancel', () => close()), btn(null, 'Enable 2FA', go, 'primary')] });
 }
 
 function changePassword(force) {
@@ -281,7 +334,7 @@ function changePassword(force) {
     const submit = async () => {
       err.textContent = '';
       if (n1.value !== n2.value) { err.textContent = 'New passwords do not match'; return; }
-      try { await api('POST', '/api/password', { old: old.value, new: n1.value }); S.me.mustChange = false; toast('Password changed'); mm.close(); res(); }
+      try { const r = await api('POST', '/api/password', { old: old.value, new: n1.value }); if (r && r.csrf) S.csrf = r.csrf; S.me.mustChange = false; toast('Password changed'); mm.close(); res(); }
       catch (e) { err.textContent = e.message; }
     };
     mm = modal(force ? 'Set a new password' : 'Change password', [
@@ -414,7 +467,7 @@ function render() {
     B('dl', 'download', 'Download', downloadSel),
     canW ? [B('ren', 'edit', 'Rename', renameSel), B('cp', 'copy', 'Copy', () => setClip('copy')), B('cut', 'cut', 'Cut', () => setClip('move')),
       B('paste', 'paste', 'Paste', pasteHere), B('del', 'trash', 'Delete', deleteSel, 'danger')] : null,
-    S.level >= 2 && !S.hits ? B('sh', 'share', 'Share', shareSel) : null,
+    S.level >= 2 && !S.hits ? [B('sh', 'share', 'Share', shareSel), B('tr', 'trash', 'Trash', openTrash)] : null,
     h('div', { class: 'seg' }, viewBtn('list', 'list', 'List view'), viewBtn('grid', 'grid', 'Grid view with thumbnails')),
     B('rf', 'refresh', '', () => { S.hits ? doSearch() : refresh(); }, 'ghost'));
 
@@ -465,7 +518,7 @@ function rowFor(e) {
   const name = e.n;
   const path = S.hits ? e.p : joinPath(S.cur.path, name);
   const key = S.hits ? e.p : name;
-  const cb = h('input', { type: 'checkbox', onclick: ev => { ev.stopPropagation(); toggleSel(key, ev.shiftKey); } });
+  const cb = h('input', { type: 'checkbox', onclick: ev => { ev.stopPropagation(); toggleSel(key, ev.shiftKey, ev); } });
   const kind = fileIcon(e);
   const draggable = S.level >= 2 && !S.hits ? 'true' : null;
   let tr;
@@ -489,7 +542,7 @@ function rowFor(e) {
   }
   tr._cb = cb; tr._e = e; tr._key = key;
   tr.addEventListener('click', ev => {
-    if (ev.ctrlKey || ev.metaKey) toggleSel(key); else if (ev.shiftKey) rangeSel(key);
+    if (ev.ctrlKey || ev.metaKey) toggleSel(key, false, ev); else if (ev.shiftKey) rangeSel(key, ev);
     else { S.sel.clear(); S.sel.add(key); S.last = key; updateSel(); }
   });
   tr.addEventListener('dblclick', () => openEntry(e, path));
@@ -500,9 +553,10 @@ function rowFor(e) {
     showMenu(ev.clientX, ev.clientY, [
       { icon: e.d ? 'folder' : 'eye', label: e.d ? 'Open' : 'Open / preview', fn: () => openEntry(e, path) },
       { icon: 'download', label: 'Download', fn: downloadSel },
+      !e.d && { icon: 'shield', label: 'SHA-256 checksum', fn: () => showHash(e.n, path) },
       w && '-', w && { icon: 'edit', label: 'Rename', fn: renameSel }, w && { icon: 'copy', label: 'Copy', fn: () => setClip('copy') },
       w && { icon: 'cut', label: 'Cut', fn: () => setClip('move') }, w && { icon: 'share', label: 'Share…', fn: shareSel },
-      w && '-', w && { icon: 'trash', label: 'Delete', fn: deleteSel }].filter(Boolean));
+      w && '-', w && { icon: 'trash', label: 'Move to Trash', fn: deleteSel }].filter(Boolean));
   });
   if (!S.hits && S.level >= 2) {
     tr.addEventListener('dragstart', ev => {
@@ -526,16 +580,16 @@ function rowFor(e) {
   return tr;
 }
 
-function toggleSel(key, range) {
-  if (range) return rangeSel(key);
+function toggleSel(key, range, ev) {
+  if (range) return rangeSel(key, ev);
   if (S.sel.has(key)) S.sel.delete(key); else S.sel.add(key);
   S.last = key; updateSel();
 }
-function rangeSel(key) {
+function rangeSel(key, ev) {
   const keys = [...rowsByName.keys()];
   const a = keys.indexOf(S.last == null ? key : S.last), b = keys.indexOf(key);
   if (a < 0 || b < 0) return;
-  if (!event || !(event.ctrlKey || event.metaKey)) S.sel.clear();
+  if (!ev || !(ev.ctrlKey || ev.metaKey)) S.sel.clear();
   for (let i = Math.min(a, b); i <= Math.max(a, b); i++) S.sel.add(keys[i]);
   updateSel();
 }
@@ -546,7 +600,7 @@ function updateSel() {
   const b = el.btns || {};
   const dis = (k, v) => { if (b[k]) b[k].disabled = v; };
   dis('dl', n === 0 && !!S.hits); dis('ren', n !== 1); dis('cp', n === 0); dis('cut', n === 0); dis('del', n === 0);
-  dis('paste', !S.clip || S.clip.mount !== S.cur.mount);
+  dis('paste', !S.clip);
   if (b.dl) b.dl.title = n ? 'Download selected' : 'Download this folder as ZIP';
   if (el.status && document.body.contains(el.status)) {
     const all = S.hits ? S.hits.items : S.entries;
@@ -598,8 +652,44 @@ async function renameSel() {
 async function deleteSel() {
   const ents = selectedEntries(); if (!ents.length) return;
   const what = ents.length === 1 ? '"' + ents[0].n + '"' : ents.length + ' items';
-  if (!await confirmBox('Delete', 'Permanently delete ' + what + '? This cannot be undone.', 'Delete', true)) return;
-  try { await api('POST', '/api/delete', { mount: S.cur.mount, path: S.cur.path, names: ents.map(e => e.n) }); S.sel.clear(); toast('Deleted'); refresh(); } catch (e) { fail(e); refresh(); }
+  if (!await confirmBox('Move to Trash', 'Move ' + what + ' to the Recycle Bin? Items are kept for 30 days.', 'Move to Trash', true)) return;
+  try { await api('POST', '/api/delete', { mount: S.cur.mount, path: S.cur.path, names: ents.map(e => e.n) }); S.sel.clear(); toast('Moved to Trash'); refresh(); } catch (e) { fail(e); refresh(); }
+}
+async function openTrash() {
+  const mnt = S.cur.mount; if (!mnt) return;
+  const holder = h('div', null, h('p', { class: 'muted' }, 'Loading…'));
+  const draw = async () => {
+    try {
+      const items = await api('GET', '/api/trash?' + q({ m: mnt }));
+      if (!items.length) { holder.replaceChildren(h('p', { class: 'muted' }, 'Recycle Bin is empty.')); return; }
+      holder.replaceChildren(
+        h('div', { class: 'row' }, h('p', { class: 'muted grow' }, 'Items are automatically removed after 30 days.'),
+          btn('trash', 'Empty Trash', async () => {
+            if (!await confirmBox('Empty Trash', 'Permanently delete all items in Trash? This cannot be undone.', 'Empty Trash', true)) return;
+            try { await api('POST', '/api/trash/empty', { mount: mnt }); toast('Trash emptied'); draw(); } catch (e) { fail(e); }
+          }, 'sm danger')),
+        tbl(['Item', 'Original folder', 'Deleted', ''], items.map(it => h('tr', null,
+          h('td', null, ic(it.dir ? 'folder' : 'file'), ' ', it.name),
+          h('td', { class: 'mono muted' }, it.origDir),
+          h('td', { class: 'muted' }, ago(it.deletedAt)),
+          h('td', null, h('div', { class: 'row' },
+            btn('refresh', 'Restore', async () => { try { await api('POST', '/api/trash/restore', { mount: mnt, ids: [it.id] }); toast('Restored'); draw(); refresh(); } catch (e) { fail(e); } }, 'sm'),
+            btn('trash', '', async () => { try { await api('POST', '/api/trash/empty', { mount: mnt, ids: [it.id] }); draw(); } catch (e) { fail(e); } }, 'sm danger')))))));
+    } catch (e) { holder.replaceChildren(h('div', { class: 'err' }, e.message)); }
+  };
+  modal('Recycle Bin — ' + mnt, holder, { cls: 'wide', nofocus: true });
+  draw();
+}
+async function showHash(name, path) {
+  const out = h('div', null, h('p', { class: 'muted' }, 'Computing SHA-256…'));
+  modal('SHA-256 Checksum — ' + name, out, { nofocus: true });
+  try {
+    const r = await api('GET', '/api/hash?' + q({ m: S.cur.mount, p: path }));
+    out.replaceChildren(
+      h('p', { class: 'muted' }, 'Size: ' + fmtSize(r.size)),
+      h('div', { class: 'copybox' }, h('input', { type: 'text', readonly: true, value: r.sha256, class: 'mono', onfocus: ev => ev.target.select() }),
+        btn('copy', 'Copy', async () => { try { await navigator.clipboard.writeText(r.sha256); toast('Copied'); } catch (_) {} }, 'sm')));
+  } catch (e) { out.replaceChildren(h('div', { class: 'err' }, e.message)); }
 }
 function setClip(op) {
   const ents = selectedEntries(); if (!ents.length) return;
@@ -609,9 +699,8 @@ function setClip(op) {
 }
 async function pasteHere() {
   const c = S.clip; if (!c) return;
-  if (c.mount !== S.cur.mount) { toast('Copy/move works inside the same shared folder', 'bad'); return; }
   try {
-    await api('POST', '/api/paste', { mount: c.mount, from: c.dir, to: S.cur.path, op: c.op, names: c.names });
+    await api('POST', '/api/paste', { mount: c.mount, destMount: S.cur.mount, from: c.dir, to: S.cur.path, op: c.op, names: c.names });
     if (c.op === 'move') S.clip = null;
     toast('Done'); refresh();
   } catch (e) { fail(e); }
@@ -664,7 +753,30 @@ function preview(e, path, kind) {
     else {
       node = h('pre', { class: 'mono' }, 'Loading…');
       fetch(url, { credentials: 'same-origin', headers: { Range: 'bytes=0-1048575' } }).then(r => r.text())
-        .then(t => { node.textContent = t + (it.s > 1048576 ? '\n\n… (truncated preview)' : ''); }).catch(() => { node.textContent = 'Could not load preview'; });
+        .then(t => {
+          node.textContent = t + (it.s > 1048576 ? '\n\n… (truncated preview)' : '');
+          if (S.level >= 2 && it.s <= 4 * 1024 * 1024 && !S.hits) {
+            const editBtn = btn('edit', 'Edit', () => {
+              const ta = h('textarea', { class: 'mono', style: 'width:100%;height:100%;resize:none;border:0;padding:16px;background:transparent;color:inherit;outline:none;font:13px/1.5 ui-monospace,monospace' });
+              ta.value = t;
+              const saveBtn = btn('check', 'Save', async () => {
+                saveBtn.disabled = true;
+                try {
+                  const res = await api('POST', '/api/save', { mount: S.cur.mount, path: p, content: ta.value, expectedMtime: it.m });
+                  it.m = res.mtime; it.s = res.size; t = ta.value;
+                  toast('Saved'); refresh();
+                } catch (e) { fail(e); }
+                saveBtn.disabled = false;
+              }, 'primary');
+              stage.replaceChildren(h('div', { style: 'display:flex;flex-direction:column;width:100%;height:100%' },
+                h('div', { class: 'row', style: 'padding:8px 12px;border-bottom:1px solid var(--bd)' }, h('span', { class: 'muted grow' }, 'Editing ' + it.n), saveBtn),
+                ta));
+              ta.focus();
+            }, 'sm');
+            editBtn.style.position = 'absolute'; editBtn.style.top = '10px'; editBtn.style.right = '14px';
+            stage.append(editBtn);
+          }
+        }).catch(() => { node.textContent = 'Could not load preview'; });
     }
     stage.replaceChildren(node);
     if (items.length > 1) stage.append(nav(-1, 'chevL', 'Previous (←)'), nav(1, 'chevR', 'Next (→)'));
@@ -711,12 +823,20 @@ function setupDnD() {
   });
 }
 
-// ============ upload engine: parallel chunks, retries, speed meter ============
-const SMALL = 8 * 1024 * 1024, MAXFILES = 3, MAXSLOTS = 6;
+// ============ upload engine: parallel chunks, resume, adaptive sizing, speed meter ============
+const SMALL = 8 * 1024 * 1024, MAXFILES = 8, MAXSLOTS = 8;
 const U = { items: [], q: [], qi: 0, running: 0, slots: 0, waiters: [], speed: 0, lastBytes: 0, timer: null, panel: null, rf: null };
 const acquire = () => new Promise(res => { if (U.slots < MAXSLOTS) { U.slots++; res(); } else U.waiters.push(res); });
 const release = () => { const n = U.waiters.shift(); if (n) n(); else U.slots--; };
 const sleep = ms => new Promise(r => setTimeout(r, ms));
+const resumeKey = it => 'dsd.up.' + [it.mount, it.path, it.rel, it.name, it.size, it.file.lastModified].join('|');
+const lsDel = k => { try { localStorage.removeItem(k); } catch (_) {} };
+function preferredChunkSize() {
+  if (U.speed > 200 * 1024 * 1024) return 64 * 1024 * 1024;
+  if (U.speed > 80 * 1024 * 1024) return 32 * 1024 * 1024;
+  if (U.speed > 25 * 1024 * 1024) return 16 * 1024 * 1024;
+  return 8 * 1024 * 1024;
+}
 
 function startUploads(list) {
   if (!list.length) return;
@@ -786,14 +906,37 @@ async function putSmall(it) {
   } finally { release(); }
 }
 async function putChunked(it) {
-  const init = await api('POST', '/api/upload', { mount: it.mount, path: it.path, rel: it.rel, name: it.name, size: it.size, mtime: it.file.lastModified, conflict: it.conflict });
+  const rk = resumeKey(it);
+  let init = null, doneSet = new Set();
+  // Try resuming an interrupted upload session from localStorage
+  const savedId = lsGet(rk);
+  if (savedId) {
+    try {
+      const st = await api('GET', '/api/upload/' + encodeURIComponent(savedId));
+      init = { id: savedId, chunk: st.chunk, n: st.n };
+      for (const idx of st.done || []) doneSet.add(idx);
+    } catch (_) { lsDel(rk); }
+  }
+  if (!init) {
+    init = await api('POST', '/api/upload', {
+      mount: it.mount, path: it.path, rel: it.rel, name: it.name,
+      size: it.size, chunkSize: preferredChunkSize(), mtime: it.file.lastModified, conflict: it.conflict,
+    });
+    lsSet(rk, init.id);
+  }
   it.uid = init.id;
   const { chunk, n } = init;
   const loaded = new Float64Array(n);
+  for (const i of doneSet) {
+    const start = i * chunk, end = Math.min(it.size, start + chunk);
+    loaded[i] = end - start;
+    it.sent += loaded[i];
+  }
   let next = 0, failure = null;
   const worker = async () => {
     while (!it.cancel && !failure && next < n) {
       const i = next++;
+      if (doneSet.has(i)) continue;
       const start = i * chunk, end = Math.min(it.size, start + chunk);
       await acquire();
       try {
@@ -805,9 +948,10 @@ async function putChunked(it) {
     }
   };
   await Promise.all(Array.from({ length: Math.min(n, MAXSLOTS) }, worker));
-  if (it.cancel) { api('DELETE', '/api/upload/' + init.id).catch(() => {}); throw new ApiError('cancelled', -1); }
-  if (failure) { api('DELETE', '/api/upload/' + init.id).catch(() => {}); throw failure; }
+  if (it.cancel) { lsDel(rk); api('DELETE', '/api/upload/' + init.id).catch(() => {}); throw new ApiError('cancelled', -1); }
+  if (failure) { throw failure; } // keep resume key so retrying resumes remaining chunks
   await api('POST', '/api/upload/' + init.id + '/finish');
+  lsDel(rk);
 }
 function cancelItem(it) {
   it.cancel = true;
@@ -834,13 +978,28 @@ function tickUploads() {
   const active = U.items.filter(i => ['queued', 'active'].includes(i.state));
   U.head.textContent = active.length ? 'Uploading ' + active.length + ' file' + (active.length > 1 ? 's' : '') + ' · ' + fmtSize(U.speed) + '/s' : 'Uploads complete';
   const shown = U.items.slice(-60);
-  U.list.replaceChildren(...shown.map(i => {
+  // In-place DOM updates: create row nodes once per item and mutate only progress/status
+  const nodes = [];
+  for (const i of shown) {
     const pct = i.size ? Math.min(100, i.sent / i.size * 100) : (i.state === 'done' ? 100 : 0);
-    const bar = h('div', { class: 'bar2 ' + (i.state === 'done' ? 'done' : i.state === 'error' ? 'bad' : '') }, h('i'));
-    bar.firstChild.style.width = pct + '%';
     const status = i.state === 'done' ? 'Done' : i.state === 'error' ? i.err : i.state === 'cancelled' ? 'Cancelled' : i.state === 'queued' ? 'Waiting' : pct.toFixed(0) + '%';
-    return h('div', { class: 'it' }, h('div', { class: 't' }, h('span', { title: (i.rel ? i.rel + '/' : '') + i.name }, (i.rel ? i.rel + '/' : '') + i.name), h('span', { class: 'muted' }, status)), bar);
-  }));
+    const barCls = 'bar2 ' + (i.state === 'done' ? 'done' : i.state === 'error' ? 'bad' : '');
+    if (!i._dom) {
+      const label = (i.rel ? i.rel + '/' : '') + i.name;
+      const st = h('span', { class: 'muted' }, status);
+      const fill = h('i');
+      const bar = h('div', { class: barCls }, fill);
+      const row = h('div', { class: 'it' }, h('div', { class: 't' }, h('span', { title: label }, label), st), bar);
+      i._dom = { row, st, bar, fill };
+    }
+    i._dom.st.textContent = status;
+    if (i._dom.bar.className !== barCls) i._dom.bar.className = barCls;
+    i._dom.fill.style.width = pct + '%';
+    nodes.push(i._dom.row);
+  }
+  if (U.list.children.length !== nodes.length || nodes.some((n, idx) => U.list.children[idx] !== n)) {
+    U.list.replaceChildren(...nodes);
+  }
   if (!active.length && U.timer) { clearInterval(U.timer); U.timer = null; }
 }
 window.addEventListener('beforeunload', ev => { if (U.items.some(i => i.state === 'active' || i.state === 'queued')) { ev.preventDefault(); ev.returnValue = ''; } });
@@ -895,20 +1054,26 @@ async function linkTab(mount, path) {
   const reload = async () => { try { box.replaceWith(await linkTab(mount, path)); } catch (e) { fail(e); } };
   const days = h('select', null, [[1, '1 day'], [7, '7 days'], [30, '30 days'], [90, '90 days'], [0, 'Never expires']].map(([v, t]) => h('option', { value: v, selected: v === 7 }, t)));
   const pw = h('input', { type: 'password', placeholder: 'Optional password', autocomplete: 'new-password' });
+  const maxHits = h('input', { type: 'number', min: 0, max: 1000000, placeholder: 'Unlimited (0)' });
+  const upOnly = h('input', { type: 'checkbox' });
   const mk = btn('link', 'Create link', async () => {
-    try { const l = await api('POST', '/api/links', { mount, path, days: +days.value, password: pw.value }); try { await navigator.clipboard.writeText(await linkBase() + '/s/' + l.token); toast('Link created and copied'); } catch (_) { toast('Link created'); } reload(); } catch (e) { fail(e); }
+    try { const l = await api('POST', '/api/links', { mount, path, days: +days.value, password: pw.value, maxHits: +maxHits.value || 0, uploadOnly: upOnly.checked }); try { await navigator.clipboard.writeText(await linkBase() + '/s/' + l.token); toast('Link created and copied'); } catch (_) { toast('Link created'); } reload(); } catch (e) { fail(e); }
   }, 'primary');
-  box.append(h('p', { class: 'muted' }, 'Anyone with the link can view and download (read-only), even without an account.' +
+  box.append(h('p', { class: 'muted' }, 'Anyone with the link can view and download (or upload only, for file-drop links), even without an account.' +
       (S.publicBase ? '' : ' These links only work for people who can reach this server directly.')),
     h('div', { class: 'grid2' }, h('div', null, h('label', { class: 'f' }, 'Expires'), days), h('div', null, h('label', { class: 'f' }, 'Password'), pw)),
+    h('div', { class: 'grid2' }, h('div', null, h('label', { class: 'f' }, 'Max uses (0 = unlimited)'), maxHits), h('div', null, h('label', { class: 'f' }, 'Mode'), h('label', { class: 'row' }, upOnly, ' File drop (upload-only folder)'))),
     h('div', { class: 'row', style: null }, mk),
     h('h4', { class: 'muted' }, 'Active links'),
     links.length ? links.map(l => {
       const url = base + '/s/' + l.token;
       return h('div', { class: 'copybox' }, h('input', { type: 'text', value: url, readonly: true, onfocus: ev => ev.target.select() }),
-        h('span', { class: 'badge' }, l.protected ? 'password' : 'open'), h('span', { class: 'badge' }, l.expires ? 'expires ' + new Date(l.expires * 1000).toLocaleDateString() : 'no expiry'),
+        l.uploadOnly ? h('span', { class: 'badge warn' }, 'file-drop') : null,
+        h('span', { class: 'badge' }, l.protected ? 'password' : 'open'),
+        l.maxHits ? h('span', { class: 'badge' }, l.hits + '/' + l.maxHits) : null,
+        h('span', { class: 'badge' }, l.expires ? 'expires ' + new Date(l.expires * 1000).toLocaleDateString() : 'no expiry'),
         btn('copy', 'Copy', async () => { try { await navigator.clipboard.writeText(url); toast('Copied'); } catch (_) { toast('Select the link and copy it', 'bad'); } }, 'sm'),
-        btn('trash', '', async () => { try { await api('DELETE', '/api/links/' + l.token); reload(); } catch (e) { fail(e); } }, 'sm danger'));
+        btn('trash', '', async () => { try { await api('DELETE', '/api/links/' + encodeURIComponent(l.token)); reload(); } catch (e) { fail(e); } }, 'sm danger'));
     }) : h('p', { class: 'muted' }, 'No links yet.'));
   box.querySelectorAll('.row').forEach(r => { r.style.marginTop = '12px'; });
   box.querySelectorAll('.copybox').forEach(r => { r.style.marginBottom = '6px'; });
@@ -939,14 +1104,18 @@ async function adminUsers() {
   const box = h('div');
   const reload = () => reloadTab(adminUsers, box);
   const showPw = (name, pw) => modal('Password for ' + name, [h('p', null, 'Share this one-time password securely. The user must change it at first login.'), h('input', { type: 'text', value: pw, readonly: true, class: 'mono', onfocus: ev => ev.target.select() })], { footer: c => [btn(null, 'Done', () => c(), 'primary')] });
-  const rows = users.map(u => h('tr', null,
-    h('td', null, h('b', null, u.name)), h('td', null, h('span', { class: 'badge ' + (u.admin ? 'warn' : '') }, u.admin ? 'admin' : 'user'), ' ', u.disabled ? h('span', { class: 'badge bad' }, 'disabled') : null),
-    h('td', { class: 'muted' }, ago(u.lastLogin)),
-    h('td', null, h('div', { class: 'row' },
-      btn('key', 'Reset password', async () => { if (!await confirmBox('Reset password', 'Generate a new password for ' + u.name + '? They will be signed out everywhere.', 'Reset')) return; try { const r = await api('PATCH', '/api/admin/users/' + u.name, { generate: true }); showPw(u.name, r.password); } catch (e) { fail(e); } }, 'sm'),
-      btn('shield', u.admin ? 'Remove admin' : 'Make admin', async () => { try { await api('PATCH', '/api/admin/users/' + u.name, { admin: !u.admin }); reload(); } catch (e) { fail(e); } }, 'sm'),
-      btn('lock', u.disabled ? 'Enable' : 'Disable', async () => { try { await api('PATCH', '/api/admin/users/' + u.name, { disabled: !u.disabled }); reload(); } catch (e) { fail(e); } }, 'sm'),
-      btn('trash', '', async () => { if (!await confirmBox('Delete user', 'Delete ' + u.name + ' and all access they were given?', 'Delete', true)) return; try { await api('DELETE', '/api/admin/users/' + u.name); reload(); } catch (e) { fail(e); } }, 'sm danger')))));
+  const rows = users.map(u => {
+    const enc = encodeURIComponent(u.name);
+    return h('tr', null,
+      h('td', null, h('b', null, u.name)), h('td', null, h('span', { class: 'badge ' + (u.admin ? 'warn' : '') }, u.admin ? 'admin' : 'user'), ' ', u.has2fa ? h('span', { class: 'badge ok' }, '2FA') : null, ' ', u.disabled ? h('span', { class: 'badge bad' }, 'disabled') : null),
+      h('td', { class: 'muted' }, ago(u.lastLogin)),
+      h('td', null, h('div', { class: 'row' },
+        btn('key', 'Reset password', async () => { if (!await confirmBox('Reset password', 'Generate a new password for ' + u.name + '? They will be signed out everywhere.', 'Reset')) return; try { const r = await api('PATCH', '/api/admin/users/' + enc, { generate: true }); showPw(u.name, r.password); } catch (e) { fail(e); } }, 'sm'),
+        u.has2fa ? btn('shield', 'Reset 2FA', async () => { if (!await confirmBox('Reset 2FA', 'Disable two-factor auth for ' + u.name + '?', 'Reset 2FA', true)) return; try { await api('PATCH', '/api/admin/users/' + enc, { reset2fa: true }); toast('2FA reset'); reload(); } catch (e) { fail(e); } }, 'sm') : null,
+        btn('shield', u.admin ? 'Remove admin' : 'Make admin', async () => { try { await api('PATCH', '/api/admin/users/' + enc, { admin: !u.admin }); reload(); } catch (e) { fail(e); } }, 'sm'),
+        btn('lock', u.disabled ? 'Enable' : 'Disable', async () => { try { await api('PATCH', '/api/admin/users/' + enc, { disabled: !u.disabled }); reload(); } catch (e) { fail(e); } }, 'sm'),
+        btn('trash', '', async () => { if (!await confirmBox('Delete user', 'Delete ' + u.name + ' and all access they were given?', 'Delete', true)) return; try { await api('DELETE', '/api/admin/users/' + enc); reload(); } catch (e) { fail(e); } }, 'sm danger'))));
+  });
   const nm = h('input', { type: 'text', placeholder: 'username', autocomplete: 'off', autocapitalize: 'none' });
   const pw = h('input', { type: 'text', placeholder: 'password (empty = generate)', autocomplete: 'off' });
   const adm = h('input', { type: 'checkbox' });
@@ -1087,8 +1256,18 @@ async function adminSessions() {
 async function adminAudit() {
   const [log, st] = await Promise.all([api('GET', '/api/admin/audit?limit=400'), api('GET', '/api/admin/status')]);
   const up = st.uptime;
+  const vRes = h('span', { class: 'muted' });
+  const vBtn = btn('shield', 'Verify integrity', async () => {
+    try {
+      const r = await api('GET', '/api/admin/audit/verify');
+      vRes.textContent = r.valid ? 'Verified (' + r.checked + ' signed entries intact)' : 'TAMPER DETECTED at line ' + r.badLine;
+      vRes.className = r.valid ? 'badge ok' : 'badge bad';
+    } catch (e) { fail(e); }
+  }, 'sm');
   return h('div', null,
-    h('p', { class: 'muted' }, 'DigitalSanDook ' + st.version + ' on ' + st.platform + ' · up ' + Math.floor(up / 3600) + 'h ' + Math.floor(up % 3600 / 60) + 'm · ' + (st.tls ? 'TLS on' : 'plain HTTP') + ' · ' + st.sessions + ' session(s) · ' + st.uploads + ' upload(s) in progress'),
+    h('div', { class: 'row' },
+      h('p', { class: 'muted grow' }, 'DigitalSanDook ' + st.version + ' on ' + st.platform + ' · up ' + Math.floor(up / 3600) + 'h ' + Math.floor(up % 3600 / 60) + 'm · ' + (st.tls ? 'TLS on' : 'plain HTTP') + ' · ' + st.sessions + ' session(s) · ' + st.uploads + ' upload(s) in progress'),
+      vRes, vBtn),
     tbl(['Time', 'User', 'IP', 'Action', 'Detail'], log.map(e => h('tr', null, h('td', { class: 'muted' }, new Date(e.t).toLocaleString()), h('td', null, e.user), h('td', { class: 'mono' }, e.ip),
       h('td', null, h('span', { class: 'badge ' + (e.action.includes('fail') ? 'bad' : '') }, e.action)), h('td', { class: 'wrap mono' }, e.detail)))));
 }

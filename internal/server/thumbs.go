@@ -9,6 +9,7 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/TinToSer/DigitalSandook/internal/fsjail"
@@ -16,6 +17,43 @@ import (
 	"github.com/TinToSer/DigitalSandook/internal/store"
 	"github.com/TinToSer/DigitalSandook/internal/thumb"
 )
+
+// thumbGroup coalesces concurrent requests for the same uncached thumbnail so
+// a single image is never decoded twice in parallel.
+type thumbCall struct {
+	wg  sync.WaitGroup
+	val []byte
+	err error
+}
+
+type thumbGroup struct {
+	mu sync.Mutex
+	m  map[string]*thumbCall
+}
+
+func newThumbGroup() *thumbGroup { return &thumbGroup{m: map[string]*thumbCall{}} }
+
+func (g *thumbGroup) do(key string, fn func() ([]byte, error)) ([]byte, error) {
+	g.mu.Lock()
+	if c, ok := g.m[key]; ok {
+		g.mu.Unlock()
+		c.wg.Wait()
+		return c.val, c.err
+	}
+	c := &thumbCall{}
+	c.wg.Add(1)
+	g.m[key] = c
+	g.mu.Unlock()
+
+	defer func() {
+		g.mu.Lock()
+		delete(g.m, key)
+		g.mu.Unlock()
+		c.wg.Done()
+	}()
+	c.val, c.err = fn()
+	return c.val, c.err
+}
 
 // hThumb serves a grid-view thumbnail. Thumbnails are cached as small JPEGs
 // in <data>/thumbs (never inside a shared folder), keyed by path+size+mtime so
@@ -51,32 +89,43 @@ func (a *App) hThumb(w http.ResponseWriter, r *http.Request, c *Ctx) {
 	}
 	dir := filepath.Join(a.dataDir, "thumbs", key[:2])
 	file := filepath.Join(dir, key+".jpg")
-	if b, err := os.ReadFile(file); err == nil {
-		now := time.Now()
-		_ = os.Chtimes(file, now, now) // LRU for thumb.CleanCache
-		sendThumb(w, b, etag)
-		return
+	if info, err := os.Stat(file); err == nil {
+		if b, err := os.ReadFile(file); err == nil {
+			// Lazy LRU touch: avoid a synchronous metadata write on every scroll hit
+			if time.Since(info.ModTime()) > 24*time.Hour {
+				now := time.Now()
+				_ = os.Chtimes(file, now, now)
+			}
+			sendThumb(w, b, etag)
+			return
+		}
 	}
 	if _, err := os.Stat(file + ".bad"); err == nil {
 		http.NotFound(w, r)
 		return
 	}
-	select { // bounded CPU/RAM: queue instead of decoding everything at once
-	case a.thumbSem <- struct{}{}:
-		defer func() { <-a.thumbSem }()
-	case <-r.Context().Done():
-		return
-	}
-	b, err := thumb.Make(f, ext)
-	_ = os.MkdirAll(dir, 0o700)
+	b, err := a.thumbFlight.do(key, func() ([]byte, error) {
+		select { // bounded CPU/RAM: queue instead of decoding everything at once
+		case a.thumbSem <- struct{}{}:
+			defer func() { <-a.thumbSem }()
+		case <-r.Context().Done():
+			return nil, r.Context().Err()
+		}
+		out, err := thumb.Make(f, ext)
+		_ = os.MkdirAll(dir, 0o700)
+		if err != nil {
+			_ = os.WriteFile(file+".bad", nil, 0o600) // don't retry broken/huge images
+			return nil, err
+		}
+		tmp := file + "." + randx.Token(6) + ".tmp"
+		if os.WriteFile(tmp, out, 0o600) == nil {
+			_ = os.Rename(tmp, file)
+		}
+		return out, nil
+	})
 	if err != nil {
-		_ = os.WriteFile(file+".bad", nil, 0o600) // don't retry broken/huge images
 		http.NotFound(w, r)
 		return
-	}
-	tmp := file + "." + randx.Token(6) + ".tmp"
-	if os.WriteFile(tmp, b, 0o600) == nil {
-		_ = os.Rename(tmp, file)
 	}
 	sendThumb(w, b, etag)
 }

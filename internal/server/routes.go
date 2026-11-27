@@ -7,23 +7,31 @@ func (a *App) routes() http.Handler {
 	api := func(pattern string, h handler) { mux.HandleFunc(pattern, a.api(h, false)) }
 	adm := func(pattern string, h handler) { mux.HandleFunc(pattern, a.api(h, true)) }
 
-	// session
+	// session & 2FA
 	mux.HandleFunc("POST /api/login", a.hLogin)
 	api("POST /api/logout", a.hLogout)
 	api("GET /api/me", a.hMe)
 	api("POST /api/password", a.hPassword)
+	api("POST /api/2fa/setup", a.h2FASetup)
+	api("POST /api/2fa/enable", a.h2FAEnable)
+	api("POST /api/2fa/disable", a.h2FADisable)
 	api("GET /api/users", a.hUsersList)
 
-	// files
+	// files & recycle bin
 	api("GET /api/list", a.hList)
 	api("POST /api/mkdir", a.hMkdir)
 	api("POST /api/delete", a.hDelete)
 	api("POST /api/rename", a.hRename)
 	api("POST /api/paste", a.hPaste)
+	api("POST /api/save", a.hSaveText)
 	api("GET /api/search", a.hSearch)
 	api("GET /api/dl", a.hDownload)
 	api("GET /api/zip", a.hZip)
 	api("GET /api/thumb", a.hThumb)
+	api("GET /api/hash", a.hHash)
+	api("GET /api/trash", a.hTrashList)
+	api("POST /api/trash/restore", a.hTrashRestore)
+	api("POST /api/trash/empty", a.hTrashEmpty)
 
 	// uploads
 	api("PUT /api/put", a.hPut)
@@ -53,6 +61,7 @@ func (a *App) routes() http.Handler {
 	adm("GET /api/admin/grants", a.hAdminGrants)
 	adm("GET /api/admin/links", a.hAdminLinks)
 	adm("GET /api/admin/audit", a.hAdminAudit)
+	adm("GET /api/admin/audit/verify", a.hAdminAuditVerify)
 	adm("GET /api/admin/sessions", a.hAdminSessions)
 	adm("DELETE /api/admin/sessions/{id}", a.hAdminSessionKick)
 	adm("GET /api/admin/status", a.hAdminStatus)
@@ -72,6 +81,7 @@ func (a *App) publicRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/public/{token}/list", a.pub(a.hPubList, false))
 	mux.HandleFunc("GET /api/public/{token}/dl", a.pub(a.hPubDownload, false))
 	mux.HandleFunc("GET /api/public/{token}/zip", a.pub(a.hPubZip, false))
+	mux.HandleFunc("PUT /api/public/{token}/upload", a.pub(a.hPubUpload, false))
 	mux.HandleFunc("GET /s/{token}", func(w http.ResponseWriter, r *http.Request) { a.site.serve(w, r, "share.html") })
 	mux.HandleFunc("GET /static/{file}", func(w http.ResponseWriter, r *http.Request) {
 		if f := r.PathValue("file"); viaTunnel(r) && f != "share.js" && f != "app.css" && f != "logo.svg" {

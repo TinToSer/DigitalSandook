@@ -126,17 +126,13 @@ func Place(root *os.Root, tmp, dir, name, conflict string) (string, error) {
 	return "", fs.ErrExist
 }
 
-func copyFile(root *os.Root, src, dst string) error {
-	in, err := root.Open(src)
+func copyFileBetween(srcRoot, dstRoot *os.Root, src, dst string) error {
+	in, st, err := OpenRegular(srcRoot, "/"+filepath.ToSlash(src))
 	if err != nil {
 		return err
 	}
 	defer in.Close()
-	st, err := in.Stat()
-	if err != nil {
-		return err
-	}
-	out, err := root.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	out, err := dstRoot.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
 	if err != nil {
 		return err
 	}
@@ -145,23 +141,24 @@ func copyFile(root *os.Root, src, dst string) error {
 		err = cerr
 	}
 	if err != nil {
-		root.Remove(dst)
+		dstRoot.Remove(dst)
 		return err
 	}
-	_ = root.Chtimes(dst, time.Now(), st.ModTime())
+	_ = dstRoot.Chtimes(dst, time.Now(), st.ModTime())
 	return nil
 }
 
-// CopyTree copies src to dst (io/fs style paths), skipping symlinks and
-// hidden scratch files. dst must not exist yet.
-//
-// The walk never descends into dst itself. Callers already refuse to copy a
-// folder into itself, but name comparison alone cannot catch every alias on
-// case-insensitive or 8.3-short-name file systems, and missing one would copy
-// the tree into itself until the disk is full.
+// CopyTree copies src to dst within root (io/fs style paths), skipping
+// symlinks and hidden scratch files. dst must not exist yet.
 func CopyTree(root *os.Root, src, dst string) error {
+	return CopyTreeBetween(root, root, src, dst)
+}
+
+// CopyTreeBetween copies src (in srcRoot) to dst (in dstRoot), supporting
+// cross-mount copies while preventing self-recursion on same-mount copies.
+func CopyTreeBetween(srcRoot, dstRoot *os.Root, src, dst string) error {
 	var dstInfo os.FileInfo
-	return fs.WalkDir(root.FS(), src, func(p string, d fs.DirEntry, err error) error {
+	return fs.WalkDir(srcRoot.FS(), src, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
@@ -178,20 +175,20 @@ func CopyTree(root *os.Root, src, dst string) error {
 		}
 		if d.IsDir() {
 			if dstInfo != nil {
-				if st, err := root.Stat(filepath.FromSlash(p)); err == nil && os.SameFile(st, dstInfo) {
+				if st, err := srcRoot.Stat(filepath.FromSlash(p)); err == nil && os.SameFile(st, dstInfo) {
 					return fs.SkipDir
 				}
 			}
-			if err := root.MkdirAll(filepath.FromSlash(target), 0o755); err != nil {
+			if err := dstRoot.MkdirAll(filepath.FromSlash(target), 0o755); err != nil {
 				return err
 			}
 			if dstInfo == nil {
-				if dstInfo, err = root.Stat(filepath.FromSlash(dst)); err != nil {
+				if dstInfo, err = dstRoot.Stat(filepath.FromSlash(dst)); err != nil {
 					return err
 				}
 			}
 			return nil
 		}
-		return copyFile(root, filepath.FromSlash(p), filepath.FromSlash(target))
+		return copyFileBetween(srcRoot, dstRoot, filepath.FromSlash(p), filepath.FromSlash(target))
 	})
 }

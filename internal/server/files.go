@@ -14,14 +14,40 @@ import (
 	"time"
 
 	"github.com/TinToSer/DigitalSandook/internal/fsjail"
+	"github.com/TinToSer/DigitalSandook/internal/randx"
 	"github.com/TinToSer/DigitalSandook/internal/store"
 )
+
+const maxSaveTextBytes = 4 << 20 // 4 MiB cap for in-browser text editor
 
 type entry struct {
 	Name  string `json:"n"`
 	Dir   bool   `json:"d"`
 	Size  int64  `json:"s"`
 	Mtime int64  `json:"m"`
+}
+
+// lessFold compares two strings case-insensitively with zero allocations on
+// the common ASCII fast path.
+func lessFold(a, b string) bool {
+	la, lb := len(a), len(b)
+	n := min(la, lb)
+	for i := 0; i < n; i++ {
+		ca, cb := a[i], b[i]
+		if ca >= 0x80 || cb >= 0x80 {
+			return strings.ToLower(a) < strings.ToLower(b)
+		}
+		if ca >= 'A' && ca <= 'Z' {
+			ca += 'a' - 'A'
+		}
+		if cb >= 'A' && cb <= 'Z' {
+			cb += 'a' - 'A'
+		}
+		if ca != cb {
+			return ca < cb
+		}
+	}
+	return la < lb
 }
 
 // listDir returns the visible entries of a directory (dirs first, by name).
@@ -54,7 +80,7 @@ func listDir(root *os.Root, osPath string) ([]entry, error) {
 		if out[i].Dir != out[j].Dir {
 			return out[i].Dir
 		}
-		return strings.ToLower(out[i].Name) < strings.ToLower(out[j].Name)
+		return lessFold(out[i].Name, out[j].Name)
 	})
 	return out, nil
 }
@@ -118,6 +144,7 @@ func (a *App) hDelete(w http.ResponseWriter, r *http.Request, c *Ctx) {
 	var in struct {
 		Mount, Path string
 		Names       []string
+		Permanent   bool
 	}
 	if !readJSON(w, r, &in) {
 		return
@@ -137,13 +164,23 @@ func (a *App) hDelete(w http.ResponseWriter, r *http.Request, c *Ctx) {
 			failed++
 			continue
 		}
-		if err := t.root.RemoveAll(filepath.Join(t.os(), n)); err != nil {
+		var err error
+		if in.Permanent {
+			err = t.root.RemoveAll(filepath.Join(t.os(), n))
+		} else {
+			err = a.moveToTrash(t, n, c.User.Name)
+		}
+		if err != nil {
 			failed++
 			continue
 		}
 		p := fsjail.Join(t.rel, n)
 		a.forgetSharing(t.m.Name, p)
-		a.auditf(c, "delete", "%s:%s", in.Mount, p)
+		action := "trash"
+		if in.Permanent {
+			action = "delete"
+		}
+		a.auditf(c, action, "%s:%s", in.Mount, p)
 	}
 	if failed > 0 {
 		jerr(w, 500, fmt.Sprintf("%d item(s) could not be deleted", failed))
@@ -182,7 +219,9 @@ func (a *App) hRename(w http.ResponseWriter, r *http.Request, c *Ctx) {
 		return
 	}
 	dst := filepath.Join(t.os(), in.To)
-	if _, err := t.root.Lstat(dst); err == nil && !strings.EqualFold(in.From, in.To) {
+	// Refuse to overwrite an existing item unless it is the exact same file
+	// being case-renamed on a case-insensitive filesystem.
+	if _, err := t.root.Lstat(dst); err == nil && !store.PathEqual(in.From, in.To) {
 		jerr(w, 409, "an item with that name already exists")
 		return
 	}
@@ -196,15 +235,19 @@ func (a *App) hRename(w http.ResponseWriter, r *http.Request, c *Ctx) {
 	writeOK(w)
 }
 
-// hPaste moves or copies items within one shared folder.
+// hPaste moves or copies items within one shared folder or across shared folders.
 func (a *App) hPaste(w http.ResponseWriter, r *http.Request, c *Ctx) {
 	var in struct {
-		Mount, From, To, Op string
-		Names               []string
+		Mount, DestMount, From, To, Op string
+		Names                          []string
 	}
 	if !readJSON(w, r, &in) {
 		return
 	}
+	if in.DestMount == "" {
+		in.DestMount = in.Mount
+	}
+	sameMount := in.Mount == in.DestMount
 	move := in.Op == "move"
 	srcNeed := store.LvlRead
 	if move {
@@ -215,7 +258,7 @@ func (a *App) hPaste(w http.ResponseWriter, r *http.Request, c *Ctx) {
 		jerr(w, code, msg)
 		return
 	}
-	dst, code, msg := a.target(c, in.Mount, in.To, store.LvlWrite)
+	dst, code, msg := a.target(c, in.DestMount, in.To, store.LvlWrite)
 	if code != 0 {
 		jerr(w, code, msg)
 		return
@@ -231,37 +274,107 @@ func (a *App) hPaste(w http.ResponseWriter, r *http.Request, c *Ctx) {
 			continue
 		}
 		from := fsjail.Join(src.rel, n)
-		// never move/copy a folder into itself (case-insensitively: on Windows
-		// and macOS "/A" and "/a" are the same folder)
-		if fsjail.Within(from, dst.rel) {
+		// Never move/copy a folder into itself (case-insensitively on same mount)
+		if sameMount && fsjail.Within(from, dst.rel) {
 			failed++
 			continue
 		}
-		if move && src.rel == dst.rel {
+		if sameMount && move && store.PathEqual(src.rel, dst.rel) {
 			continue
 		}
 		name := fsjail.UniqueName(dst.root, dst.rel, n)
 		to := fsjail.Join(dst.rel, name)
 		var err error
-		if move {
+		if sameMount && move {
 			err = dst.root.Rename(fsjail.OSPath(from), fsjail.OSPath(to))
 		} else {
-			err = fsjail.CopyTree(dst.root, fsjail.FSPath(from), fsjail.FSPath(to))
+			err = fsjail.CopyTreeBetween(src.root, dst.root, fsjail.FSPath(from), fsjail.FSPath(to))
+			if err == nil && move {
+				err = src.root.RemoveAll(fsjail.OSPath(from))
+			}
 		}
 		if err != nil {
 			failed++
 			continue
 		}
 		if move {
-			a.moveSharing(in.Mount, from, to)
+			if sameMount {
+				a.moveSharing(in.Mount, from, to)
+			} else {
+				a.forgetSharing(in.Mount, from)
+			}
 		}
-		a.auditf(c, in.Op, "%s:%s -> %s", in.Mount, from, to)
+		a.auditf(c, in.Op, "%s:%s -> %s:%s", in.Mount, from, in.DestMount, to)
 	}
 	if failed > 0 {
 		jerr(w, 500, fmt.Sprintf("%d item(s) could not be processed", failed))
 		return
 	}
 	writeOK(w)
+}
+
+// hSaveText saves edited text/code/markdown files atomically with optional
+// optimistic-locking conflict detection via expectedMtime.
+func (a *App) hSaveText(w http.ResponseWriter, r *http.Request, c *Ctx) {
+	var in struct {
+		Mount         string `json:"mount"`
+		Path          string `json:"path"`
+		Content       string `json:"content"`
+		ExpectedMtime int64  `json:"expectedMtime"`
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxSaveTextBytes+64<<10)
+	if !readJSON(w, r, &in) {
+		return
+	}
+	if len(in.Content) > maxSaveTextBytes {
+		jerr(w, 413, "file is too large to edit in browser (max 4 MB)")
+		return
+	}
+	t, code, msg := a.target(c, in.Mount, in.Path, store.LvlWrite)
+	if code != 0 {
+		jerr(w, code, msg)
+		return
+	}
+	f, st, err := fsjail.OpenRegular(t.root, t.rel)
+	if err != nil {
+		fsErr(w, err)
+		return
+	}
+	f.Close()
+	if in.ExpectedMtime > 0 && st.ModTime().Unix() != in.ExpectedMtime {
+		jerr(w, 409, "file was modified on disk since you opened it; reload before saving")
+		return
+	}
+	if err := fsjail.EnsureTmp(t.root); err != nil {
+		fsErr(w, err)
+		return
+	}
+	tmp := filepath.Join(fsjail.TmpDir, randx.Token(12)+".edit")
+	wf, err := t.root.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	if err != nil {
+		fsErr(w, err)
+		return
+	}
+	_, err = wf.WriteString(in.Content)
+	if cerr := wf.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		t.root.Remove(tmp)
+		fsErr(w, err)
+		return
+	}
+	if err := t.root.Rename(tmp, t.os()); err != nil {
+		t.root.Remove(tmp)
+		fsErr(w, err)
+		return
+	}
+	var newMtime int64
+	if nst, err := t.root.Stat(t.os()); err == nil {
+		newMtime = nst.ModTime().Unix()
+	}
+	a.auditf(c, "edit", "%s:%s (%d bytes)", t.m.Name, t.rel, len(in.Content))
+	writeJSON(w, 200, map[string]any{"ok": true, "mtime": newMtime, "size": len(in.Content)})
 }
 
 func (a *App) hSearch(w http.ResponseWriter, r *http.Request, c *Ctx) {

@@ -5,6 +5,11 @@ import (
 	"time"
 )
 
+const (
+	limiterMaxEntries = 100_000
+	limiterEvictBatch = 1024
+)
+
 type limEntry struct {
 	fails int
 	until time.Time
@@ -37,10 +42,26 @@ func (l *Limiter) Fail(key string, free int, base, maxWait time.Duration) {
 	now := time.Now()
 	e := l.m[key]
 	if e == nil {
-		if len(l.m) >= 100_000 { // bound memory under a distributed attack
+		if len(l.m) >= limiterMaxEntries {
+			// Bound memory and lock hold time under distributed attacks:
+			// first evict expired entries up to a batch, then random entries if still full.
+			evicted := 0
 			for k, v := range l.m {
-				if now.After(v.until) {
+				if now.After(v.until) && now.Sub(v.last) > 30*time.Minute {
 					delete(l.m, k)
+					evicted++
+					if evicted >= limiterEvictBatch {
+						break
+					}
+				}
+			}
+			if evicted == 0 {
+				for k := range l.m {
+					delete(l.m, k)
+					evicted++
+					if evicted >= limiterEvictBatch {
+						break
+					}
 				}
 			}
 		}
@@ -70,8 +91,9 @@ func (l *Limiter) Reset(key string) {
 // GC forgets keys that have been quiet for an hour.
 func (l *Limiter) GC() {
 	l.mu.Lock()
+	now := time.Now()
 	for k, e := range l.m {
-		if time.Since(e.last) > time.Hour {
+		if now.Sub(e.last) > time.Hour && now.After(e.until) {
 			delete(l.m, k)
 		}
 	}

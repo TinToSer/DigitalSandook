@@ -1,12 +1,15 @@
 package server
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -16,10 +19,15 @@ import (
 )
 
 const (
-	chunkSize   = 8 << 20
-	maxChunks   = 200000
-	maxActiveUp = 256 // concurrent chunked uploads per user
-	uploadIdle  = 6 * time.Hour
+	chunkSize         = 8 << 20
+	minChunkSize      = 4 << 20
+	maxChunkSize      = 64 << 20
+	maxPutSize        = 32 << 20  // single-request PUT cap (larger files use chunked upload)
+	maxUploadSize     = 100 << 30 // 100 GiB per file cap
+	maxChunks         = 200000
+	maxActiveUp       = 64  // concurrent chunked uploads per user
+	maxActiveUpGlobal = 512 // global cap to protect OS file descriptor limits
+	uploadIdle        = 6 * time.Hour
 )
 
 // Uploads are written to a hidden scratch dir inside the shared folder (same
@@ -36,6 +44,9 @@ type upload struct {
 	root                                            *os.Root
 	mtime                                           int64
 
+	ioMu   sync.RWMutex // RLock for chunk Pwrite; Lock for Close/Sync/abort
+	closed bool
+
 	mu   sync.Mutex
 	done []bool
 	got  int
@@ -50,21 +61,30 @@ type uploads struct {
 func newUploads() *uploads { return &uploads{m: map[string]*upload{}} }
 
 func (u *upload) abort() {
-	u.f.Close()
-	u.root.Remove(u.tmp)
+	u.ioMu.Lock()
+	if !u.closed {
+		u.closed = true
+		u.f.Close()
+		u.root.Remove(u.tmp)
+	}
+	u.ioMu.Unlock()
 }
 
 func (us *uploads) gc() {
+	var expired []*upload
 	us.mu.Lock()
-	defer us.mu.Unlock()
 	for id, u := range us.m {
 		u.mu.Lock()
 		idle := time.Since(u.last) > uploadIdle
 		u.mu.Unlock()
 		if idle {
-			u.abort()
+			expired = append(expired, u)
 			delete(us.m, id)
 		}
+	}
+	us.mu.Unlock()
+	for _, u := range expired {
+		u.abort()
 	}
 }
 
@@ -72,6 +92,21 @@ func (us *uploads) count() int {
 	us.mu.Lock()
 	defer us.mu.Unlock()
 	return len(us.m)
+}
+
+func (us *uploads) canStart(user string) bool {
+	us.mu.Lock()
+	defer us.mu.Unlock()
+	if len(us.m) >= maxActiveUpGlobal {
+		return false
+	}
+	active := 0
+	for _, e := range us.m {
+		if e.user == user {
+			active++
+		}
+	}
+	return active < maxActiveUp
 }
 
 // deadlineReader pushes the read deadline forward while data keeps flowing,
@@ -106,7 +141,11 @@ func ensureSubdirs(t *target, rel string) (string, bool) {
 		return t.rel, true
 	}
 	full := fsjail.Join(t.rel, clean)
-	if err := t.root.MkdirAll(fsjail.OSPath(full), 0o755); err != nil {
+	osPath := fsjail.OSPath(full)
+	if st, err := t.root.Stat(osPath); err == nil && st.IsDir() {
+		return full, true
+	}
+	if err := t.root.MkdirAll(osPath, 0o755); err != nil {
 		return "", false
 	}
 	return full, true
@@ -132,6 +171,10 @@ func (a *App) hPut(w http.ResponseWriter, r *http.Request, c *Ctx) {
 		jerr(w, 400, "invalid file name")
 		return
 	}
+	if r.ContentLength > maxPutSize {
+		jerr(w, 413, "file too large for direct upload; use chunked upload")
+		return
+	}
 	dir, ok := ensureSubdirs(t, q.Get("rel"))
 	if !ok {
 		jerr(w, 400, "invalid folder path")
@@ -147,13 +190,29 @@ func (a *App) hPut(w http.ResponseWriter, r *http.Request, c *Ctx) {
 		fsErr(w, err)
 		return
 	}
-	n, err := fsjail.CopyBuffered(f, bodyReader(w, r))
+	wantHash := strings.ToLower(strings.TrimSpace(r.Header.Get("X-Content-SHA256")))
+	var src io.Reader = io.LimitReader(bodyReader(w, r), maxPutSize+1)
+	var hasher = sha256.New()
+	if wantHash != "" {
+		src = io.TeeReader(src, hasher)
+	}
+	n, err := fsjail.CopyBuffered(f, src)
 	if cerr := f.Close(); err == nil {
 		err = cerr
 	}
 	if err != nil {
 		t.root.Remove(tmp)
 		jerr(w, 400, "upload interrupted")
+		return
+	}
+	if n > maxPutSize {
+		t.root.Remove(tmp)
+		jerr(w, 413, "file too large for direct upload; use chunked upload")
+		return
+	}
+	if wantHash != "" && hex.EncodeToString(hasher.Sum(nil)) != wantHash {
+		t.root.Remove(tmp)
+		jerr(w, 400, "checksum mismatch")
 		return
 	}
 	final, err := fsjail.Place(t.root, tmp, dir, name, q.Get("conflict"))
@@ -176,6 +235,7 @@ func (a *App) hUploadInit(w http.ResponseWriter, r *http.Request, c *Ctx) {
 	var in struct {
 		Mount, Path, Rel, Name, Conflict string
 		Size                             int64
+		ChunkSize                        int64
 		Mtime                            int64
 	}
 	if !readJSON(w, r, &in) {
@@ -186,8 +246,13 @@ func (a *App) hUploadInit(w http.ResponseWriter, r *http.Request, c *Ctx) {
 		jerr(w, code, msg)
 		return
 	}
-	if !fsjail.ValidNewName(in.Name) || in.Size < 0 || in.Size > 1<<50 {
+	if !fsjail.ValidNewName(in.Name) || in.Size < 0 || in.Size > maxUploadSize {
 		jerr(w, 400, "invalid file")
+		return
+	}
+	// Check concurrency caps BEFORE creating or truncating files on disk
+	if !a.ups.canStart(c.User.Name) {
+		jerr(w, 429, "too many uploads in progress")
 		return
 	}
 	dir, ok := ensureSubdirs(t, in.Rel)
@@ -196,6 +261,9 @@ func (a *App) hUploadInit(w http.ResponseWriter, r *http.Request, c *Ctx) {
 		return
 	}
 	chunk := int64(chunkSize)
+	if in.ChunkSize >= minChunkSize && in.ChunkSize <= maxChunkSize {
+		chunk = in.ChunkSize
+	}
 	for (in.Size+chunk-1)/chunk > maxChunks {
 		chunk *= 2
 	}
@@ -211,17 +279,20 @@ func (a *App) hUploadInit(w http.ResponseWriter, r *http.Request, c *Ctx) {
 		fsErr(w, err)
 		return
 	}
+	fsjail.SetSparse(f)
 	if err := f.Truncate(in.Size); err != nil {
 		f.Close()
 		t.root.Remove(tmp)
 		fsErr(w, err)
 		return
 	}
-	u := &upload{id: id, user: c.User.Name, mount: t.m.Name, mountPath: t.m.Path, dir: dir, name: in.Name,
+	u := &upload{
+		id: id, user: c.User.Name, mount: t.m.Name, mountPath: t.m.Path, dir: dir, name: in.Name,
 		conflict: in.Conflict, size: in.Size, chunk: chunk, n: n, tmp: tmp, f: f, root: t.root, mtime: in.Mtime,
-		done: make([]bool, n), last: time.Now()}
+		done: make([]bool, n), last: time.Now(),
+	}
 
-	// count and register under one lock, so parallel requests cannot overshoot the cap
+	// Re-check and register atomically under one lock
 	a.ups.mu.Lock()
 	active := 0
 	for _, e := range a.ups.m {
@@ -229,11 +300,12 @@ func (a *App) hUploadInit(w http.ResponseWriter, r *http.Request, c *Ctx) {
 			active++
 		}
 	}
-	if active < maxActiveUp {
+	allowed := len(a.ups.m) < maxActiveUpGlobal && active < maxActiveUp
+	if allowed {
 		a.ups.m[id] = u
 	}
 	a.ups.mu.Unlock()
-	if active >= maxActiveUp {
+	if !allowed {
 		u.abort()
 		jerr(w, 429, "too many uploads in progress")
 		return
@@ -258,6 +330,11 @@ func (a *App) hUploadChunk(w http.ResponseWriter, r *http.Request, c *Ctx) {
 	if u == nil {
 		return
 	}
+	// Re-verify write permission so a revoked user cannot keep writing chunks
+	if a.store.Level(c.User, u.mount, u.dir) < store.LvlWrite {
+		jerr(w, 403, "you no longer have permission to write here")
+		return
+	}
 	idx, err := strconv.Atoi(r.PathValue("idx"))
 	if err != nil || idx < 0 || idx >= u.n {
 		jerr(w, 400, "bad chunk index")
@@ -269,9 +346,26 @@ func (a *App) hUploadChunk(w http.ResponseWriter, r *http.Request, c *Ctx) {
 		jerr(w, 400, fmt.Sprintf("chunk must be %d bytes", want))
 		return
 	}
-	n, err := fsjail.CopyBuffered(io.NewOffsetWriter(u.f, off), io.LimitReader(bodyReader(w, r), want))
+	u.ioMu.RLock()
+	if u.closed {
+		u.ioMu.RUnlock()
+		jerr(w, 409, "upload session closed")
+		return
+	}
+	wantHash := strings.ToLower(strings.TrimSpace(r.Header.Get("X-Chunk-SHA256")))
+	var src io.Reader = io.LimitReader(bodyReader(w, r), want)
+	var hasher = sha256.New()
+	if wantHash != "" {
+		src = io.TeeReader(src, hasher)
+	}
+	n, err := fsjail.CopyBuffered(io.NewOffsetWriter(u.f, off), src)
+	u.ioMu.RUnlock()
 	if err != nil || n != want {
 		jerr(w, 400, "chunk interrupted")
+		return
+	}
+	if wantHash != "" && hex.EncodeToString(hasher.Sum(nil)) != wantHash {
+		jerr(w, 400, "chunk checksum mismatch")
 		return
 	}
 	u.mu.Lock()
@@ -306,8 +400,8 @@ func (a *App) hUploadFinish(w http.ResponseWriter, r *http.Request, c *Ctx) {
 	if u == nil {
 		return
 	}
-	// claim the session exclusively so concurrent finish/abort calls cannot
-	// close or delete the temp file underneath us
+	// Claim the session exclusively so concurrent finish/abort calls cannot
+	// close or delete the temp file underneath us.
 	a.ups.mu.Lock()
 	if a.ups.m[u.id] != u {
 		a.ups.mu.Unlock()
@@ -324,22 +418,27 @@ func (a *App) hUploadFinish(w http.ResponseWriter, r *http.Request, c *Ctx) {
 	}
 	delete(a.ups.m, u.id)
 	a.ups.mu.Unlock()
+
+	// Wait for any in-flight duplicate chunk writers to exit before closing
+	u.ioMu.Lock()
+	u.closed = true
 	err := u.f.Sync()
 	if cerr := u.f.Close(); err == nil {
 		err = cerr
 	}
+	u.ioMu.Unlock()
 	if err != nil {
 		u.root.Remove(u.tmp)
 		fsErr(w, err)
 		return
 	}
-	// the shared folder may have been removed or re-pointed while the upload ran
+	// The shared folder may have been removed or re-pointed while the upload ran
 	if m, ok := a.store.Mount(u.mount); !ok || m.Path != u.mountPath {
 		u.root.Remove(u.tmp)
 		jerr(w, 409, "the shared folder changed during the upload")
 		return
 	}
-	// permissions may have changed while the upload ran
+	// Permissions may have changed while the upload ran
 	if lvl := a.store.Level(c.User, u.mount, u.dir); lvl < store.LvlWrite {
 		u.root.Remove(u.tmp)
 		jerr(w, 403, "you no longer have permission to write here")

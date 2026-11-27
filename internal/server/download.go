@@ -3,17 +3,37 @@ package server
 import (
 	"archive/zip"
 	"bufio"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"io"
 	"io/fs"
 	"mime"
 	"net/http"
 	"os"
 	"path"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/TinToSer/DigitalSandook/internal/fsjail"
 	"github.com/TinToSer/DigitalSandook/internal/store"
 )
+
+var zipBufPool = sync.Pool{New: func() any { return bufio.NewWriterSize(nil, 1<<20) }}
+
+// deadlineWriter refreshes the write deadline while streaming so slow-reading
+// clients cannot hold archive slots open indefinitely.
+type deadlineWriter struct {
+	w    io.Writer
+	rc   *http.ResponseController
+	idle time.Duration
+}
+
+func (d *deadlineWriter) Write(p []byte) (int, error) {
+	_ = d.rc.SetWriteDeadline(time.Now().Add(d.idle))
+	return d.w.Write(p)
+}
 
 // Types that may be shown inline (preview). Everything else is forced to
 // download, and every response carries a sandboxing CSP, so an uploaded
@@ -125,6 +145,27 @@ func (a *App) hDownload(w http.ResponseWriter, r *http.Request, c *Ctx) {
 	serveFile(w, r, f, st, path.Base(t.rel), inline)
 }
 
+// hHash streams a file through SHA-256 and returns its hex digest + size.
+func (a *App) hHash(w http.ResponseWriter, r *http.Request, c *Ctx) {
+	q := r.URL.Query()
+	t, code, msg := a.target(c, q.Get("m"), q.Get("p"), store.LvlRead)
+	if code != 0 {
+		jerr(w, code, msg)
+		return
+	}
+	f, st, good := openForDownload(w, t)
+	if !good {
+		return
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := fsjail.CopyBuffered(h, f); err != nil {
+		fsErr(w, err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"sha256": hex.EncodeToString(h.Sum(nil)), "size": st.Size()})
+}
+
 // hZip streams a ZIP (stored, no compression => wire speed) of a folder or of
 // selected names inside a folder. Nothing is buffered or written to disk.
 func (a *App) hZip(w http.ResponseWriter, r *http.Request, c *Ctx) {
@@ -214,7 +255,14 @@ func (a *App) streamZip(w http.ResponseWriter, r *http.Request, c *Ctx, t *targe
 	h.Set("Content-Security-Policy", "default-src 'none'; sandbox")
 	h.Set("Cache-Control", "no-store")
 	w.WriteHeader(200)
-	bw := bufio.NewWriterSize(w, 1<<20)
+
+	dw := &deadlineWriter{w: w, rc: http.NewResponseController(w), idle: 60 * time.Second}
+	bw := zipBufPool.Get().(*bufio.Writer)
+	bw.Reset(dw)
+	defer func() {
+		bw.Reset(nil)
+		zipBufPool.Put(bw)
+	}()
 	zw := zip.NewWriter(bw)
 	a.auditf(c, "zip", "%s:%s %s", t.m.Name, t.rel, describeNames(names))
 	ctx := r.Context()
@@ -247,12 +295,13 @@ func (a *App) streamZip(w http.ResponseWriter, r *http.Request, c *Ctx, t *targe
 				_, err := zw.CreateHeader(hdr)
 				return err
 			}
-			hdr.UncompressedSize64 = uint64(info.Size()) // lets the writer pick ZIP64 up front
-			f, err := fsys.Open(p)
+			// Use OpenRegular to avoid blocking on a raced FIFO or following a swapped symlink
+			f, st, err := fsjail.OpenRegular(t.root, "/"+p)
 			if err != nil {
 				return nil
 			}
 			defer f.Close()
+			hdr.UncompressedSize64 = uint64(st.Size()) // lets the writer pick ZIP64 up front
 			zwr, err := zw.CreateHeader(hdr)
 			if err != nil {
 				return err

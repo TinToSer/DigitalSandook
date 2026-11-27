@@ -36,6 +36,7 @@ async function main() {
   let info;
   try { info = await get(base + '/info'); } catch (e) { return shell(h('p', null, e.message)); }
   if (info.needsPassword) return askPassword(info);
+  if (info.uploadOnly) return dropView(info);
   if (!info.isDir) return fileView(info);
   browse(info, '/');
 }
@@ -47,11 +48,37 @@ function askPassword(info) {
     try { await get(base + '/unlock', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password: pw.value }) }); main(); }
     catch (e) { err.textContent = e.message; }
   };
-  shell(h('form', { onsubmit: go }, h('p', null, h('b', null, info.name), ' is password protected.'), pw, err, h('div', { class: 'row' }, h('button', { class: 'btn primary', type: 'submit' }, 'Unlock'))));
+  shell(h('form', { onsubmit: go }, h('p', null, info.uploadOnly ? 'This file-drop link is password protected.' : 'This shared link is password protected.'), pw, err, h('div', { class: 'row' }, h('button', { class: 'btn primary', type: 'submit' }, 'Unlock'))));
   pw.focus();
 }
 function fileView(info) {
   shell(h('p', null, h('b', null, info.name)), h('a', { class: 'btn primary', href: base + '/dl?p=/', download: '' }, 'Download'));
+}
+function dropView(info) {
+  const list = h('div');
+  const inp = h('input', { type: 'file', multiple: true, class: 'hide', onchange: ev => { sendFiles([...ev.target.files]); ev.target.value = ''; } });
+  const sendOne = file => new Promise((res, rej) => {
+    const st = h('span', { class: 'muted' }, '0%');
+    const bar = h('div', { class: 'bar2' }, h('i'));
+    list.append(h('div', { class: 'it' }, h('div', { class: 't' }, h('span', null, file.name + ' (' + fmtSize(file.size) + ')'), st), bar));
+    const x = new XMLHttpRequest();
+    x.open('PUT', base + '/upload?' + q({ name: file.name }));
+    x.upload.onprogress = e => { if (e.total) { const p = Math.min(100, e.loaded / e.total * 100); bar.firstChild.style.width = p + '%'; st.textContent = p.toFixed(0) + '%'; } };
+    x.onload = () => {
+      if (x.status < 300) { bar.classList.add('done'); bar.firstChild.style.width = '100%'; st.textContent = 'Uploaded'; res(); }
+      else { let m = 'Failed (' + x.status + ')'; try { m = JSON.parse(x.responseText).error || m; } catch (_) {} bar.classList.add('bad'); st.textContent = m; rej(new Error(m)); }
+    };
+    x.onerror = () => { bar.classList.add('bad'); st.textContent = 'Network error'; rej(new Error('network error')); };
+    x.send(file);
+  });
+  const sendFiles = async files => {
+    for (const f of files) { try { await sendOne(f); } catch (_) {} }
+  };
+  const drop = h('div', { class: 'empty', onclick: () => inp.click(), ondragover: ev => ev.preventDefault(), ondrop: ev => { ev.preventDefault(); sendFiles([...ev.dataTransfer.files]); } },
+    h('p', null, 'Drop files here or click to upload to ', h('b', null, info.name)),
+    h('p', { class: 'muted' }, 'Upload-only link (max 100 MB per file). Existing files cannot be viewed or overwritten.'),
+    h('button', { class: 'btn primary', type: 'button' }, 'Choose files'));
+  shell(drop, inp, list);
 }
 async function browse(info, path) {
   let d;

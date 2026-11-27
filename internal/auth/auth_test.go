@@ -72,3 +72,58 @@ func TestLimiterLocksOut(t *testing.T) {
 		t.Fatal("reset did not unlock")
 	}
 }
+
+func TestSessionRotateAndCap(t *testing.T) {
+	ss := NewSessions()
+	tok1, s1 := ss.Create("alice", "1.2.3.4", "ua")
+	tok2, s2 := ss.Rotate(s1)
+	if tok1 == tok2 || s1.CSRF == s2.CSRF {
+		t.Fatal("Rotate did not issue fresh token and CSRF")
+	}
+	if ss.Lookup(tok1) != nil || ss.Lookup(tok2) != s2 {
+		t.Fatal("Rotate did not replace old session")
+	}
+	for i := 0; i < MaxSessionsPerUser+5; i++ {
+		ss.Create("bob", "1.2.3.4", "ua")
+	}
+	bobCount := 0
+	for _, info := range ss.List() {
+		if info.User == "bob" {
+			bobCount++
+		}
+	}
+	if bobCount > MaxSessionsPerUser {
+		t.Fatalf("bob has %d sessions, want <= %d", bobCount, MaxSessionsPerUser)
+	}
+}
+
+func TestTOTPAndRecoveryCodes(t *testing.T) {
+	secret := GenerateTOTPSecret()
+	uri := TOTPURI("DigitalSanDook", "alice", secret)
+	if !strings.HasPrefix(uri, "otpauth://totp/") || !strings.Contains(uri, secret) {
+		t.Fatalf("bad URI: %s", uri)
+	}
+	now := time.Unix(1_700_000_000, 0)
+	step := now.Unix() / totpPeriod
+	// Decode secret and generate exact code
+	_, ok := VerifyTOTP(secret, "000000", now, 0)
+	_ = ok // random chance 1/1e6, test replay with known secret below
+	const testSecret = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"
+	// Compute via internal helper for deterministic check
+	code := totpCode([]byte("Hello!\xde\xad\xbe\xefHello!\xde\xad\xbe\xef"), step)
+	matched, valid := VerifyTOTP(testSecret, code, now, 0)
+	if !valid || matched != step {
+		t.Fatalf("valid TOTP rejected: matched=%d valid=%v", matched, valid)
+	}
+	// Replay at same step must fail
+	if _, valid := VerifyTOTP(testSecret, code, now, matched); valid {
+		t.Fatal("replayed TOTP code was accepted")
+	}
+	plain, hashes := GenerateRecoveryCodes(8)
+	if len(plain) != 8 || len(hashes) != 8 {
+		t.Fatalf("got %d recovery codes", len(plain))
+	}
+	if HashRecoveryCode(plain[0]) != hashes[0] {
+		t.Fatal("recovery code hash mismatch")
+	}
+}

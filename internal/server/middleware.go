@@ -5,6 +5,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/TinToSer/DigitalSandook/internal/auth"
@@ -29,13 +30,24 @@ const tunnelKey ctxKey = 1
 // viaTunnel reports whether r arrived on the Cloudflare Tunnel listener.
 func viaTunnel(r *http.Request) bool { v, _ := r.Context().Value(tunnelKey).(bool); return v }
 
+// isTrustedProxyIP reports whether RemoteAddr is a loopback or private address
+// eligible to supply X-Forwarded-* headers when -trust-proxy is enabled.
+func isTrustedProxyIP(remoteAddr string) bool {
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		host = remoteAddr
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && (ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast())
+}
+
 func (a *App) clientIP(r *http.Request) string {
 	if viaTunnel(r) { // loopback-only listener fed by cloudflared
 		if ip := strings.TrimSpace(r.Header.Get("Cf-Connecting-Ip")); net.ParseIP(ip) != nil {
 			return ip
 		}
 	}
-	if a.trustProxy {
+	if a.trustProxy && isTrustedProxyIP(r.RemoteAddr) {
 		if xf := r.Header.Get("X-Forwarded-For"); xf != "" {
 			parts := strings.Split(xf, ",")
 			if ip := strings.TrimSpace(parts[len(parts)-1]); net.ParseIP(ip) != nil {
@@ -54,7 +66,7 @@ func (a *App) isSecure(r *http.Request) bool {
 	if r.TLS != nil || viaTunnel(r) { // Cloudflare terminates TLS for tunnel traffic
 		return true
 	}
-	return a.trustProxy && r.Header.Get("X-Forwarded-Proto") == "https"
+	return a.trustProxy && isTrustedProxyIP(r.RemoteAddr) && strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")
 }
 
 // ---------- security middleware ----------
@@ -75,7 +87,7 @@ func (a *App) secure(next http.Handler) http.Handler {
 		h.Set("Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=(), usb=()")
 		h.Set("Content-Security-Policy", appCSP)
 		if a.isSecure(r) {
-			h.Set("Strict-Transport-Security", "max-age=31536000")
+			h.Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
 		}
 		if strings.HasPrefix(r.URL.Path, "/api/") {
 			h.Set("Cache-Control", "no-store")
@@ -95,7 +107,7 @@ func (a *App) secure(next http.Handler) http.Handler {
 
 // sameOrigin rejects cross-site state-changing requests (CSRF defence in depth
 // on top of SameSite=Strict cookies and the X-CSRF-Token header).
-func sameOrigin(r *http.Request) bool {
+func (a *App) sameOrigin(r *http.Request) bool {
 	if sf := r.Header.Get("Sec-Fetch-Site"); sf != "" && sf != "same-origin" && sf != "none" {
 		return false
 	}
@@ -104,8 +116,15 @@ func sameOrigin(r *http.Request) bool {
 		return false
 	}
 	if o != "" {
-		i := strings.Index(o, "://")
-		if i < 0 || o[i+3:] != r.Host {
+		u, err := url.Parse(o)
+		if err != nil || u.Host == "" {
+			return false
+		}
+		wantScheme := "http"
+		if a.isSecure(r) {
+			wantScheme = "https"
+		}
+		if !strings.EqualFold(u.Scheme, wantScheme) || !strings.EqualFold(u.Host, r.Host) {
 			return false
 		}
 	}
@@ -129,7 +148,7 @@ func (a *App) api(h handler, adminOnly bool) http.HandlerFunc {
 			return
 		}
 		if !isSafeMethod(r.Method) {
-			if !sameOrigin(r) || !auth.ConstantTimeEqual(r.Header.Get("X-CSRF-Token"), s.CSRF) {
+			if !a.sameOrigin(r) || !auth.ConstantTimeEqual(r.Header.Get("X-CSRF-Token"), s.CSRF) {
 				jerr(w, 403, "request rejected (CSRF)")
 				return
 			}

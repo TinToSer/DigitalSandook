@@ -66,3 +66,13 @@ func TestExifOrientationShortInput(t *testing.T) {
 		}
 	}
 }
+
+func BenchmarkMakeJPEG(b *testing.B) {
+	data := jpegWithOrientation(2400, 1600, 6)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := Make(bytes.NewReader(data), ".jpg"); err != nil {
+			b.Fatal(err)
+		}
+	}
+}

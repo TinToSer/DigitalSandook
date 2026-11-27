@@ -13,8 +13,10 @@ import (
 )
 
 const (
-	SessionIdle = 12 * time.Hour      // signed out after this much inactivity
-	SessionMax  = 14 * 24 * time.Hour // absolute lifetime
+	SessionIdle        = 12 * time.Hour      // signed out after this much inactivity
+	SessionMax         = 14 * 24 * time.Hour // absolute lifetime
+	MaxSessionsPerUser = 32
+	MaxSessionsTotal   = 10_000
 )
 
 // Session is a signed-in browser. Only the SHA-256 of its bearer token is
@@ -51,21 +53,81 @@ type Sessions struct {
 
 func NewSessions() *Sessions { return &Sessions{m: map[[32]byte]*Session{}} }
 
-// Create starts a session and returns its bearer token (for the cookie).
-func (ss *Sessions) Create(user, ip, ua string) (token string, s *Session) {
+func (ss *Sessions) newSession(user, ip, ua string) (token string, s *Session) {
 	raw := make([]byte, 32)
-	rand.Read(raw)
+	if _, err := rand.Read(raw); err != nil {
+		panic(err)
+	}
 	token = base64.RawURLEncoding.EncodeToString(raw)
 	key := sha256.Sum256([]byte(token))
 	now := time.Now()
 	if len(ua) > 200 {
 		ua = ua[:200]
 	}
-	s = &Session{ID: hex.EncodeToString(key[:6]), User: user, CSRF: randx.Token(24),
-		Created: now, IP: ip, UA: ua, key: key}
+	s = &Session{
+		ID: hex.EncodeToString(key[:6]), User: user, CSRF: randx.Token(24),
+		Created: now, IP: ip, UA: ua, key: key,
+	}
 	s.last.Store(now.UnixNano())
+	return token, s
+}
+
+// Create starts a session and returns its bearer token (for the cookie).
+// Enforces per-user and global session caps by evicting the oldest idle session.
+func (ss *Sessions) Create(user, ip, ua string) (token string, s *Session) {
+	token, s = ss.newSession(user, ip, ua)
+	now := time.Now()
 	ss.mu.Lock()
-	ss.m[key] = s
+	// Enforce per-user cap (evict oldest session for this user)
+	var userCount int
+	var oldestUserKey [32]byte
+	var oldestUserTime time.Time
+	for k, cur := range ss.m {
+		if cur.expired(now) {
+			delete(ss.m, k)
+			continue
+		}
+		if cur.User == user {
+			userCount++
+			ls := cur.LastSeen()
+			if oldestUserTime.IsZero() || ls.Before(oldestUserTime) {
+				oldestUserTime = ls
+				oldestUserKey = k
+			}
+		}
+	}
+	if userCount >= MaxSessionsPerUser {
+		delete(ss.m, oldestUserKey)
+	}
+	// Enforce global cap
+	if len(ss.m) >= MaxSessionsTotal {
+		var oldestKey [32]byte
+		var oldestTime time.Time
+		for k, cur := range ss.m {
+			ls := cur.LastSeen()
+			if oldestTime.IsZero() || ls.Before(oldestTime) {
+				oldestTime = ls
+				oldestKey = k
+			}
+		}
+		if !oldestTime.IsZero() {
+			delete(ss.m, oldestKey)
+		}
+	}
+	ss.m[s.key] = s
+	ss.mu.Unlock()
+	return
+}
+
+// Rotate replaces an existing session with a fresh bearer token and CSRF token
+// (e.g. after a password change to prevent session fixation).
+func (ss *Sessions) Rotate(old *Session) (token string, s *Session) {
+	token, s = ss.newSession(old.User, old.IP, old.UA)
+	ss.mu.Lock()
+	if ss.m[old.key] == old {
+		delete(ss.m, old.key)
+	}
+	ss.m[s.key] = s
 	ss.mu.Unlock()
 	return
 }

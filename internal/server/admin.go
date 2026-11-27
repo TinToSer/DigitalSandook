@@ -42,10 +42,12 @@ func (a *App) addMount(name, p string, readOnly bool) error {
 		return fmt.Errorf("%q is not a folder", p)
 	}
 	// never expose the application's own state (password hashes, TLS key)
-	if dd, err := filepath.EvalSymlinks(a.dataDir); err == nil {
-		if within(dd, real) || within(real, dd) {
-			return errors.New("a shared folder cannot contain or live inside the " + AppName + " data folder")
-		}
+	dd, err := filepath.EvalSymlinks(a.dataDir)
+	if err != nil {
+		return fmt.Errorf("cannot verify data folder isolation: %w", err)
+	}
+	if within(dd, real) || within(real, dd) {
+		return errors.New("a shared folder cannot contain or live inside the " + AppName + " data folder")
 	}
 	root, err := os.OpenRoot(real)
 	if err != nil {
@@ -79,6 +81,7 @@ type adminUser struct {
 	Name      string `json:"name"`
 	Admin     bool   `json:"admin"`
 	Disabled  bool   `json:"disabled"`
+	Has2FA    bool   `json:"has2fa"`
 	Created   int64  `json:"created"`
 	LastLogin int64  `json:"lastLogin"`
 }
@@ -86,7 +89,7 @@ type adminUser struct {
 func (a *App) hAdminUsers(w http.ResponseWriter, r *http.Request, c *Ctx) {
 	out := []adminUser{}
 	for _, u := range a.store.Users() {
-		out = append(out, adminUser{u.Name, u.Admin, u.Disabled, u.Created.Unix(), u.LastLogin.Unix()})
+		out = append(out, adminUser{u.Name, u.Admin, u.Disabled, u.Has2FA(), u.Created.Unix(), u.LastLogin.Unix()})
 	}
 	writeJSON(w, 200, out)
 }
@@ -143,6 +146,7 @@ func (a *App) hAdminUserPatch(w http.ResponseWriter, r *http.Request, c *Ctx) {
 		Generate bool
 		Admin    *bool
 		Disabled *bool
+		Reset2FA bool
 	}
 	if !readJSON(w, r, &in) {
 		return
@@ -182,16 +186,19 @@ func (a *App) hAdminUserPatch(w http.ResponseWriter, r *http.Request, c *Ctx) {
 		if in.Disabled != nil {
 			u.Disabled = *in.Disabled
 		}
+		if in.Reset2FA {
+			u.TOTPSecret, u.TOTPLastStep, u.RecoveryCodes = "", 0, nil
+		}
 		return nil
 	})
 	if err != nil {
 		userErr(w, err)
 		return
 	}
-	if newHash != "" || u.Disabled {
+	if newHash != "" || u.Disabled || in.Reset2FA {
 		a.sess.DropUser(name, nil)
 	}
-	a.auditf(c, "user-update", "%s admin=%v disabled=%v pwreset=%v", name, u.Admin, u.Disabled, newHash != "")
+	a.auditf(c, "user-update", "%s admin=%v disabled=%v pwreset=%v reset2fa=%v", name, u.Admin, u.Disabled, newHash != "", in.Reset2FA)
 	resp := map[string]any{"ok": true}
 	if in.Generate {
 		resp["password"] = newPw
@@ -314,6 +321,11 @@ func (a *App) hAdminAudit(w http.ResponseWriter, r *http.Request, c *Ctx) {
 		return
 	}
 	writeJSONz(w, r, 200, e)
+}
+
+func (a *App) hAdminAuditVerify(w http.ResponseWriter, r *http.Request, c *Ctx) {
+	checked, valid, badLine := a.aud.Verify()
+	writeJSON(w, 200, map[string]any{"checked": checked, "valid": valid, "badLine": badLine})
 }
 
 func (a *App) hAdminSessions(w http.ResponseWriter, r *http.Request, c *Ctx) {

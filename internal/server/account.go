@@ -16,6 +16,7 @@ type userView struct {
 	Name       string `json:"name"`
 	Admin      bool   `json:"admin"`
 	MustChange bool   `json:"mustChange"`
+	Has2FA     bool   `json:"has2fa"`
 }
 
 func (a *App) cookieName(r *http.Request) string {
@@ -45,23 +46,23 @@ func (a *App) sessionFrom(r *http.Request) *auth.Session {
 var errChanged = errors.New("account changed meanwhile")
 
 func (a *App) hLogin(w http.ResponseWriter, r *http.Request) {
-	if !sameOrigin(r) {
+	if !a.sameOrigin(r) {
 		jerr(w, 403, "request rejected")
 		return
 	}
-	var in struct{ Username, Password string }
+	var in struct{ Username, Password, TOTP string }
 	if !readJSON(w, r, &in) {
 		return
 	}
 	name := strings.ToLower(strings.TrimSpace(in.Username))
 	ip := a.clientIP(r)
-	ipKey, userKey := "ip:"+ip, "u:"+name
-	if d := max(a.lim.Wait(ipKey), a.lim.Wait(userKey)); d > 0 {
+	ipKey, pairKey, userKey := "ip:"+ip, "iu:"+ip+":"+name, "u:"+name
+	if d := max(a.lim.Wait(ipKey), max(a.lim.Wait(pairKey), a.lim.Wait(userKey))); d > 0 {
 		w.Header().Set("Retry-After", strconv.Itoa(int(d.Seconds())+1))
 		jerr(w, 429, fmt.Sprintf("too many attempts, try again in %d seconds", int(d.Seconds())+1))
 		return
 	}
-	if len(in.Password) > 1024 || len(name) > 64 {
+	if len(in.Password) > 1024 || len(name) > 64 || len(in.TOTP) > 32 {
 		jerr(w, 400, "invalid credentials")
 		return
 	}
@@ -76,38 +77,73 @@ func (a *App) hLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	good := auth.VerifyPassword(in.Password, hash)
 	release()
-	loggedIn := false
-	if good && exists && !u.Disabled {
-		// Record the login on the *current* record. The account may have been
-		// disabled or its password reset while we were hashing.
-		u, loggedIn = a.loginRecorded(u.Name, hash)
-	}
-	if !loggedIn {
+	if !good || !exists || u.Disabled {
 		a.lim.Fail(ipKey, 6, 20*time.Second, 15*time.Minute)
-		a.lim.Fail(userKey, 12, 30*time.Second, 10*time.Minute)
+		a.lim.Fail(pairKey, 6, 20*time.Second, 15*time.Minute)
+		// High threshold on global userKey prevents single-IP account lockout DoS
+		// while still throttling distributed credential stuffing.
+		a.lim.Fail(userKey, 40, 10*time.Second, 2*time.Minute)
 		a.aud.Write(name, ip, "login-failed", "")
 		jerr(w, 401, "invalid username or password")
 		return
 	}
+	if u.Has2FA() {
+		code := strings.TrimSpace(in.TOTP)
+		if code == "" {
+			writeJSON(w, 200, map[string]any{"needs2fa": true})
+			return
+		}
+		if !a.verifyUser2FA(u, code) {
+			a.lim.Fail(ipKey, 6, 20*time.Second, 15*time.Minute)
+			a.lim.Fail(pairKey, 5, 30*time.Second, 15*time.Minute)
+			a.aud.Write(name, ip, "login-2fa-failed", "")
+			jerr(w, 401, "invalid authentication code")
+			return
+		}
+	}
+	// Record the login on the *current* record (in memory, flushed periodically
+	// so logins never stall on an fsync).
+	u, loggedIn := a.store.RecordLogin(u.Name, hash)
+	if !loggedIn {
+		a.aud.Write(name, ip, "login-failed", "changed")
+		jerr(w, 401, "invalid username or password")
+		return
+	}
 	a.lim.Reset(ipKey)
-	a.lim.Reset(userKey)
+	a.lim.Reset(pairKey)
 	token, s := a.sess.Create(u.Name, ip, r.UserAgent())
 	a.setCookie(w, r, token, int(auth.SessionMax.Seconds()))
 	a.aud.Write(u.Name, ip, "login", "")
 	writeJSON(w, 200, map[string]any{
-		"user": userView{u.Name, u.Admin, u.MustChange}, "csrf": s.CSRF,
+		"user": userView{u.Name, u.Admin, u.MustChange, u.Has2FA()}, "csrf": s.CSRF,
 	})
 }
 
-func (a *App) loginRecorded(name, verifiedHash string) (store.User, bool) {
-	u, err := a.store.UpdateUser(name, func(cur *store.User) error {
-		if cur.Disabled || cur.Hash != verifiedHash {
-			return errChanged
+// verifyUser2FA checks a 6-digit TOTP code (updating TOTPLastStep to prevent
+// replay) or consumes a single-use recovery code.
+func (a *App) verifyUser2FA(u store.User, code string) bool {
+	if step, ok := auth.VerifyTOTP(u.TOTPSecret, code, time.Now(), u.TOTPLastStep); ok {
+		_, err := a.store.UpdateUser(u.Name, func(cur *store.User) error {
+			if cur.TOTPLastStep >= step {
+				return errChanged // replayed concurrently
+			}
+			cur.TOTPLastStep = step
+			return nil
+		})
+		return err == nil
+	}
+	// Try single-use recovery code
+	wantHash := auth.HashRecoveryCode(code)
+	_, err := a.store.UpdateUser(u.Name, func(cur *store.User) error {
+		for i, h := range cur.RecoveryCodes {
+			if auth.ConstantTimeEqual(h, wantHash) {
+				cur.RecoveryCodes = append(cur.RecoveryCodes[:i], cur.RecoveryCodes[i+1:]...)
+				return nil
+			}
 		}
-		cur.LastLogin = time.Now()
-		return nil
+		return errChanged
 	})
-	return u, err == nil
+	return err == nil
 }
 
 func (a *App) hLogout(w http.ResponseWriter, r *http.Request, c *Ctx) {
@@ -119,7 +155,7 @@ func (a *App) hLogout(w http.ResponseWriter, r *http.Request, c *Ctx) {
 
 func (a *App) hMe(w http.ResponseWriter, r *http.Request, c *Ctx) {
 	writeJSON(w, 200, map[string]any{
-		"user":       userView{c.User.Name, c.User.Admin, c.User.MustChange},
+		"user":       userView{c.User.Name, c.User.Admin, c.User.MustChange, c.User.Has2FA()},
 		"csrf":       c.Sess.CSRF,
 		"roots":      a.store.Roots(c.User),
 		"publicBase": a.tunnel.PublicBase(),
@@ -170,8 +206,103 @@ func (a *App) hPassword(w http.ResponseWriter, r *http.Request, c *Ctx) {
 		jerr(w, 500, "could not save")
 		return
 	}
-	a.sess.DropUser(c.User.Name, c.Sess) // sign out other devices
+	// Rotate current session token & CSRF token and sign out all other devices
+	newTok, newSess := a.sess.Rotate(c.Sess)
+	a.sess.DropUser(c.User.Name, newSess)
+	a.setCookie(w, r, newTok, int(auth.SessionMax.Seconds()))
 	a.auditf(c, "password-change", "")
+	writeJSON(w, 200, map[string]any{"ok": true, "csrf": newSess.CSRF})
+}
+
+// ---------- TOTP 2FA ----------
+
+func (a *App) h2FASetup(w http.ResponseWriter, r *http.Request, c *Ctx) {
+	secret := auth.GenerateTOTPSecret()
+	uri := auth.TOTPURI(AppName, c.User.Name, secret)
+	writeJSON(w, 200, map[string]any{"secret": secret, "uri": uri})
+}
+
+func (a *App) h2FAEnable(w http.ResponseWriter, r *http.Request, c *Ctx) {
+	var in struct{ Password, Secret, Code string }
+	if !readJSON(w, r, &in) {
+		return
+	}
+	limKey := "2fa:" + c.User.Name
+	if d := a.lim.Wait(limKey); d > 0 {
+		jerr(w, 429, "too many attempts, try later")
+		return
+	}
+	release, ok := a.hashSlot(w, r)
+	if !ok {
+		return
+	}
+	good := auth.VerifyPassword(in.Password, c.User.Hash)
+	release()
+	if !good {
+		a.lim.Fail(limKey, 5, 30*time.Second, 10*time.Minute)
+		jerr(w, 403, "current password is incorrect")
+		return
+	}
+	step, valid := auth.VerifyTOTP(in.Secret, in.Code, time.Now(), 0)
+	if !valid {
+		a.lim.Fail(limKey, 5, 30*time.Second, 10*time.Minute)
+		jerr(w, 400, "invalid 6-digit code; check your authenticator clock")
+		return
+	}
+	plain, hashes := auth.GenerateRecoveryCodes(8)
+	_, err := a.store.UpdateUser(c.User.Name, func(u *store.User) error {
+		u.TOTPSecret = strings.ToUpper(strings.TrimSpace(in.Secret))
+		u.TOTPLastStep = step
+		u.RecoveryCodes = hashes
+		return nil
+	})
+	if err != nil {
+		jerr(w, 500, "could not save")
+		return
+	}
+	a.auditf(c, "2fa-enable", "")
+	writeJSON(w, 200, map[string]any{"ok": true, "recoveryCodes": plain})
+}
+
+func (a *App) h2FADisable(w http.ResponseWriter, r *http.Request, c *Ctx) {
+	var in struct{ Password, Code string }
+	if !readJSON(w, r, &in) {
+		return
+	}
+	if !c.User.Has2FA() {
+		writeOK(w)
+		return
+	}
+	limKey := "2fa:" + c.User.Name
+	if d := a.lim.Wait(limKey); d > 0 {
+		jerr(w, 429, "too many attempts, try later")
+		return
+	}
+	release, ok := a.hashSlot(w, r)
+	if !ok {
+		return
+	}
+	good := auth.VerifyPassword(in.Password, c.User.Hash)
+	release()
+	if !good {
+		a.lim.Fail(limKey, 5, 30*time.Second, 10*time.Minute)
+		jerr(w, 403, "current password is incorrect")
+		return
+	}
+	if !a.verifyUser2FA(c.User, in.Code) {
+		a.lim.Fail(limKey, 5, 30*time.Second, 10*time.Minute)
+		jerr(w, 403, "invalid authentication code")
+		return
+	}
+	_, err := a.store.UpdateUser(c.User.Name, func(u *store.User) error {
+		u.TOTPSecret, u.TOTPLastStep, u.RecoveryCodes = "", 0, nil
+		return nil
+	})
+	if err != nil {
+		jerr(w, 500, "could not save")
+		return
+	}
+	a.auditf(c, "2fa-disable", "")
 	writeOK(w)
 }
 

@@ -249,3 +249,83 @@ func TestZipName(t *testing.T) {
 		}
 	}
 }
+
+func TestTrashRestoreAndEmpty(t *testing.T) {
+	_, srv, shared := testApp(t)
+	c := newClient(t, srv.URL)
+	c.login("admin", testPW)
+	c.must("PUT", "/api/put"+q("m", "docs", "p", "/", "name", "note.txt"), []byte("keep me"))
+	c.must("POST", "/api/delete", map[string]any{"mount": "docs", "path": "/", "names": []string{"note.txt"}})
+	if _, err := os.Stat(filepath.Join(shared, "note.txt")); err == nil {
+		t.Fatal("deleted file still exists in root")
+	}
+	var items []trashMeta
+	json.Unmarshal(c.must("GET", "/api/trash"+q("m", "docs"), nil), &items)
+	if len(items) != 1 || items[0].Name != "note.txt" {
+		t.Fatalf("trash list = %+v", items)
+	}
+	c.must("POST", "/api/trash/restore", map[string]any{"mount": "docs", "ids": []string{items[0].ID}})
+	if got := c.must("GET", "/api/dl"+q("m", "docs", "p", "/note.txt"), nil); string(got) != "keep me" {
+		t.Fatalf("restored content = %q", got)
+	}
+}
+
+func TestPublicLinkPrivacyMaxHitsAndFileDrop(t *testing.T) {
+	_, srv, shared := testApp(t)
+	os.WriteFile(filepath.Join(shared, "secret-plan.txt"), []byte("top-secret"), 0o644)
+	c := newClient(t, srv.URL)
+	c.login("admin", testPW)
+
+	// 1. Password-protected link must not leak filename before unlock
+	var locked struct{ Token string }
+	json.Unmarshal(c.must("POST", "/api/links", map[string]any{"mount": "docs", "path": "/secret-plan.txt", "days": 1, "password": "secret-1", "maxHits": 1}), &locked)
+	anon := newClient(t, srv.URL)
+	infoRaw := anon.must("GET", "/api/public/"+locked.Token+"/info", nil)
+	if strings.Contains(string(infoRaw), "secret-plan.txt") {
+		t.Fatalf("locked link info leaked filename: %s", infoRaw)
+	}
+	anon.must("POST", "/api/public/"+locked.Token+"/unlock", map[string]string{"password": "secret-1"})
+	if got := anon.must("GET", "/api/public/"+locked.Token+"/dl"+q("p", "/"), nil); string(got) != "top-secret" {
+		t.Fatalf("download 1 = %q", got)
+	}
+	// Second download must fail due to maxHits=1
+	if code, _ := anon.do("GET", "/api/public/"+locked.Token+"/dl"+q("p", "/"), nil); code != 404 {
+		t.Fatalf("second download after maxHits=1 returned %d", code)
+	}
+
+	// 2. Upload-only (File Drop) link
+	var drop struct{ Token string }
+	json.Unmarshal(c.must("POST", "/api/links", map[string]any{"mount": "docs", "path": "/", "days": 1, "uploadOnly": true}), &drop)
+	if code, _ := anon.do("GET", "/api/public/"+drop.Token+"/list", nil); code != 403 {
+		t.Fatalf("listing on upload-only link returned %d", code)
+	}
+	anon.must("PUT", "/api/public/"+drop.Token+"/upload"+q("name", "guest.txt"), []byte("from guest"))
+	if got := c.must("GET", "/api/dl"+q("m", "docs", "p", "/guest.txt"), nil); string(got) != "from guest" {
+		t.Fatalf("dropped file = %q", got)
+	}
+}
+
+func TestHashSaveTextAndAuditVerify(t *testing.T) {
+	_, srv, _ := testApp(t)
+	c := newClient(t, srv.URL)
+	c.login("admin", testPW)
+	c.must("PUT", "/api/put"+q("m", "docs", "p", "/", "name", "doc.txt"), []byte("hello"))
+
+	var h struct{ SHA256 string }
+	json.Unmarshal(c.must("GET", "/api/hash"+q("m", "docs", "p", "/doc.txt"), nil), &h)
+	if h.SHA256 != "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824" {
+		t.Fatalf("unexpected sha256: %q", h.SHA256)
+	}
+	c.must("POST", "/api/save", map[string]any{"mount": "docs", "path": "/doc.txt", "content": "updated"})
+	if got := c.must("GET", "/api/dl"+q("m", "docs", "p", "/doc.txt"), nil); string(got) != "updated" {
+		t.Fatalf("saved text = %q", got)
+	}
+	var vr struct {
+		Valid   bool
+		Checked int
+	}
+	json.Unmarshal(c.must("GET", "/api/admin/audit/verify", nil), &vr)
+	if !vr.Valid || vr.Checked < 2 {
+		t.Fatalf("audit verify = %+v", vr)
+	}
+}

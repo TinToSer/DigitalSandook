@@ -10,7 +10,8 @@ import (
 )
 
 const (
-	TmpDir    = ".dsd-tmp" // per-folder scratch dir for in-flight uploads (hidden)
+	TmpDir    = ".dsd-tmp"   // per-folder scratch dir for in-flight uploads (hidden)
+	TrashDir  = ".dsd-trash" // per-folder soft-delete recycle bin (hidden)
 	hiddenPre = ".dsd-"
 )
 

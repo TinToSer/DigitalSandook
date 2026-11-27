@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -32,15 +33,19 @@ var (
 )
 
 type User struct {
-	Name       string    `json:"name"`
-	Hash       string    `json:"hash"`
-	Admin      bool      `json:"admin"`
-	Disabled   bool      `json:"disabled"`
-	MustChange bool      `json:"mustChange"`
-	Created    time.Time `json:"created"`
-	LastLogin  time.Time `json:"lastLogin"`
+	Name          string    `json:"name"`
+	Hash          string    `json:"hash"`
+	Admin         bool      `json:"admin"`
+	Disabled      bool      `json:"disabled"`
+	MustChange    bool      `json:"mustChange"`
+	Created       time.Time `json:"created"`
+	LastLogin     time.Time `json:"lastLogin"`
+	TOTPSecret    string    `json:"totpSecret,omitempty"`
+	TOTPLastStep  int64     `json:"totpLastStep,omitempty"`
+	RecoveryCodes []string  `json:"recoveryCodes,omitempty"`
 }
 
+func (u User) Has2FA() bool       { return u.TOTPSecret != "" }
 func (u *User) activeAdmin() bool { return u.Admin && !u.Disabled }
 
 type Mount struct {
@@ -60,14 +65,16 @@ type Grant struct {
 }
 
 type Link struct {
-	Token    string    `json:"token"`
-	Mount    string    `json:"mount"`
-	Path     string    `json:"path"`
-	Owner    string    `json:"owner"`
-	Created  time.Time `json:"created"`
-	Expires  int64     `json:"expires"` // unix seconds, 0 = never
-	PassHash string    `json:"passHash,omitempty"`
-	Hits     int       `json:"hits"`
+	Token      string    `json:"token"`
+	Mount      string    `json:"mount"`
+	Path       string    `json:"path"`
+	Owner      string    `json:"owner"`
+	Created    time.Time `json:"created"`
+	Expires    int64     `json:"expires"` // unix seconds, 0 = never
+	PassHash   string    `json:"passHash,omitempty"`
+	Hits       int       `json:"hits"`
+	MaxHits    int       `json:"maxHits,omitempty"`    // 0 = unlimited
+	UploadOnly bool      `json:"uploadOnly,omitempty"` // true = file-drop link
 }
 
 // Settings are server-wide options managed from the admin panel.
@@ -278,6 +285,21 @@ func (s *Store) UpdateUser(name string, fn func(u *User) error) (User, error) {
 	return u, s.saveLocked()
 }
 
+// RecordLogin verifies the user was not disabled or had their password changed
+// while hashing, updates LastLogin in memory, and marks the store dirty so
+// logins never stall on an fsync.
+func (s *Store) RecordLogin(name, verifiedHash string) (User, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cur, ok := s.d.Users[name]
+	if !ok || cur.Disabled || cur.Hash != verifiedHash {
+		return User{}, false
+	}
+	cur.LastLogin = time.Now()
+	s.dirty = true
+	return *cur, true
+}
+
 func (s *Store) activeAdminsLocked() int {
 	n := 0
 	for _, u := range s.d.Users {
@@ -362,9 +384,31 @@ func (s *Store) DeleteMount(name string) error {
 
 // ---- grants ----
 
+const caseInsensitiveFS = runtime.GOOS == "windows" || runtime.GOOS == "darwin"
+
+// PathEqual reports whether two clean paths refer to the same location on the
+// host operating system's filesystem.
+func PathEqual(a, b string) bool {
+	if caseInsensitiveFS {
+		return strings.EqualFold(a, b)
+	}
+	return a == b
+}
+
 // Under reports whether the clean path p equals base or lies beneath it.
+// On case-insensitive platforms (Windows, macOS) comparison ignores case so
+// grants and links stay attached regardless of letter casing.
 func Under(base, p string) bool {
-	return base == "/" || p == base || strings.HasPrefix(p, base+"/")
+	if base == "/" {
+		return true
+	}
+	if len(p) < len(base) {
+		return false
+	}
+	if !PathEqual(p[:len(base)], base) {
+		return false
+	}
+	return len(p) == len(base) || p[len(base)] == '/'
 }
 
 // Level returns the effective access level of u for mount/rel (rel is a clean
@@ -489,7 +533,7 @@ func (s *Store) GrantsAround(mount, rel string) (direct, inherited []Grant) {
 		if g.Mount != mount {
 			continue
 		}
-		if g.Path == rel {
+		if PathEqual(g.Path, rel) {
 			direct = append(direct, g)
 		} else if Under(g.Path, rel) {
 			inherited = append(inherited, g)
@@ -503,7 +547,7 @@ func (s *Store) SetGrant(g Grant) (Grant, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, e := range s.d.Grants {
-		if e.Mount == g.Mount && e.Path == g.Path && e.User == g.User {
+		if e.Mount == g.Mount && PathEqual(e.Path, g.Path) && e.User == g.User {
 			e.Level = g.Level
 			return *e, s.saveLocked()
 		}
@@ -554,12 +598,12 @@ func (s *Store) DropPath(mount, p string) error {
 // MovePath re-targets grants and links on from (or beneath it) to the same
 // place under to, so sharing follows an item when it is renamed or moved.
 func (s *Store) MovePath(mount, from, to string) error {
-	if from == "/" || from == to || Under(from, to) {
+	if from == "/" || PathEqual(from, to) || Under(from, to) {
 		return nil // the root never moves; nothing can move into itself
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	moved := func(p string) string { return to + strings.TrimPrefix(p, from) }
+	moved := func(p string) string { return to + p[len(from):] }
 	changed := false
 	for _, g := range s.d.Grants {
 		if g.Mount != mount || !Under(from, g.Path) {
@@ -568,7 +612,7 @@ func (s *Store) MovePath(mount, from, to string) error {
 		np := moved(g.Path)
 		// a stale grant for the same person at the destination is superseded
 		for id, e := range s.d.Grants {
-			if e != g && e.Mount == mount && e.Path == np && e.User == g.User {
+			if e != g && e.Mount == mount && PathEqual(e.Path, np) && e.User == g.User {
 				delete(s.d.Grants, id)
 			}
 		}
@@ -624,13 +668,20 @@ func (s *Store) DeleteLink(token string) error {
 	return s.saveLocked()
 }
 
-// HitLink counts a download. The counter is kept in memory and written by the
-// next Flush (or any other save), so downloads never wait for an fsync.
-func (s *Store) HitLink(token string) {
+// HitLink counts a download (or file-drop upload) and enforces MaxHits.
+// The counter is kept in memory and written by the next Flush (or any other
+// save), so downloads never wait for an fsync.
+func (s *Store) HitLink(token string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if l, ok := s.d.Links[token]; ok {
-		l.Hits++
-		s.dirty = true
+	l, ok := s.d.Links[token]
+	if !ok {
+		return false
 	}
+	if l.MaxHits > 0 && l.Hits >= l.MaxHits {
+		return false
+	}
+	l.Hits++
+	s.dirty = true
+	return true
 }

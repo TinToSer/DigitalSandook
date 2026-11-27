@@ -42,23 +42,25 @@ type Config struct {
 }
 
 type App struct {
-	cfg        Config
-	store      *store.Store
-	sess       *auth.Sessions
-	lim        *auth.Limiter
-	ups        *uploads
-	aud        *audit.Log
-	roots      *fsjail.RootCache
-	tunnel     *Tunnel
-	site       *staticSite
-	dataDir    string
-	trustProxy bool
-	tlsOn      bool
-	hashSem    chan struct{} // bounds concurrent password hashing (CPU)
-	zipSem     chan struct{}
-	searchSem  chan struct{}
-	thumbSem   chan struct{} // bounds concurrent image decoding (CPU/RAM)
-	started    time.Time
+	cfg         Config
+	store       *store.Store
+	sess        *auth.Sessions
+	lim         *auth.Limiter
+	ups         *uploads
+	aud         *audit.Log
+	roots       *fsjail.RootCache
+	tunnel      *Tunnel
+	site        *staticSite
+	dataDir     string
+	trustProxy  bool
+	tlsOn       bool
+	hashSem     chan struct{} // bounds concurrent password hashing (CPU)
+	zipSem      chan struct{} // authenticated ZIP downloads
+	pubZipSem   chan struct{} // anonymous public link ZIP downloads (isolated)
+	searchSem   chan struct{}
+	thumbSem    chan struct{} // bounds concurrent image decoding (CPU/RAM)
+	thumbFlight *thumbGroup   // deduplicates concurrent identical thumbnail decodes
+	started     time.Time
 }
 
 // New opens the data folder and prepares the application without listening.
@@ -78,6 +80,7 @@ func New(cfg Config) (*App, error) {
 	if err != nil {
 		return nil, fmt.Errorf("cannot open audit log: %w", err)
 	}
+	aud.SetKey(st.Secret())
 	site, err := newStatic()
 	if err != nil {
 		return nil, err
@@ -85,11 +88,13 @@ func New(cfg Config) (*App, error) {
 	a := &App{
 		cfg: cfg, store: st, sess: auth.NewSessions(), lim: auth.NewLimiter(), ups: newUploads(), aud: aud,
 		roots: fsjail.NewRootCache(), site: site, dataDir: dataAbs, trustProxy: cfg.TrustProxy, tlsOn: !cfg.PlainHTTP,
-		hashSem:   make(chan struct{}, max(2, runtime.NumCPU())),
-		thumbSem:  make(chan struct{}, max(2, min(runtime.NumCPU(), 4))),
-		zipSem:    make(chan struct{}, 64),
-		searchSem: make(chan struct{}, 8),
-		started:   time.Now(),
+		hashSem:     make(chan struct{}, max(2, runtime.NumCPU())),
+		thumbSem:    make(chan struct{}, max(2, min(runtime.NumCPU(), 4))),
+		zipSem:      make(chan struct{}, 64),
+		pubZipSem:   make(chan struct{}, 16),
+		searchSem:   make(chan struct{}, 8),
+		thumbFlight: newThumbGroup(),
+		started:     time.Now(),
 	}
 	a.tunnel = &Tunnel{app: a, explicit: cfg.Cloudflared, state: "off"}
 	for _, s := range cfg.Shares {
@@ -302,6 +307,7 @@ func (a *App) background(ctx context.Context) {
 			}
 			if n%60 == 1 {
 				thumb.CleanCache(filepath.Join(a.dataDir, "thumbs"), thumb.CacheMax)
+				a.purgeExpiredTrash()
 			}
 		}
 	}
