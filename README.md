@@ -23,11 +23,24 @@ no installer, no database, no runtime, no dependencies.
 ## Why DigitalSanDook?
 
 * **One executable.** The web UI is embedded. Copy it anywhere and run it. No CGO, no database, zero third-party Go modules.
-* **Fast.** Parallel, resumable, chunked uploads; zero-copy `sendfile` downloads with HTTP Range
-  (resume, seek in video); streamed ZIP with no temp files; HTTP/2 with enlarged flow-control windows.
-* **Hardened by default.** HTTPS out of the box, kernel-enforced folder jail, CSRF protection, strict CSP, brute-force lockout.
-* **Multi-user with real access control.** Viewer / Editor / Owner per folder or file, re-shares that follow a chain of trust, public links with expiry and password.
+* **Fast.** Parallel, **resumable** chunked uploads with adaptive chunk sizing (8–64 MiB) and sparse Windows NTFS allocation; zero-copy `sendfile` downloads with HTTP Range (resume, seek in video); streamed ZIP with no temp files; HTTP/2 with enlarged flow-control windows; 2-pass fast-path thumbnailer with singleflight caching.
+* **Hardened by default.** HTTPS out of the box, built-in **TOTP 2FA (RFC 6238)** + single-use recovery codes, kernel-enforced folder jail (`os.Root`), tamper-evident **HMAC-chained audit log**, CSRF protection, strict CSP, session rotation, and brute-force lockout.
+* **Multi-user with real access control.** Viewer / Editor / Owner per folder or file, re-shares that follow a chain of trust, public links with expiry, password, **max-uses (burn-after-N)**, and **upload-only File-Drop links**.
+* **Power features built in.** 30-day **Recycle Bin (Trash)** with one-click restore, **cross-mount copy/move**, **in-browser text/code editor** with conflict detection, and **SHA-256 checksum verification**.
 * **Runs everywhere.** Windows, Linux (amd64, arm64, armv7, 386, riscv64, ppc64le, s390x), macOS (Intel + Apple Silicon), FreeBSD, OpenBSD, NetBSD - and a multi-arch Docker image.
+
+### How it compares
+
+| Feature | DigitalSanDook | FileBrowser | Nextcloud |
+|---|---|---|---|
+| **Single binary, 0 third-party Go deps** | Yes (~7 MB) | Go + external deps | No (PHP + DB + Redis) |
+| **Kernel-enforced `os.Root` jail** | Yes | No | No |
+| **Built-in TOTP 2FA + recovery codes** | Yes (zero deps) | No | Plugin |
+| **Tamper-evident HMAC audit log** | Yes | No | Enterprise / app |
+| **File-Drop (upload-only) & max-hit links** | Yes | No | Yes |
+| **Resumable adaptive chunked uploads** | Yes | Basic | Yes |
+| **Built-in isolated Cloudflare Tunnel** | Yes (links-only) | No | No |
+| **Recycle Bin + in-browser editor** | Yes | Editor only | Yes |
 
 **Interface:** list or grid view with photo thumbnails, sortable (remembered per browser), light / dark /
 follow-system theme, status bar (item counts, sizes, selection), preview gallery for images, video, audio,
@@ -199,17 +212,16 @@ Cloudflare for rate-limiting and the audit log. Use a link password and expiry f
   through races. Symlinks/devices are hidden and never followed out. Users only ever see the share name, never real paths.
 * **Passwords**: PBKDF2-HMAC-SHA256, 600 000 iterations, per-user salt, constant-time compare, equal
   work for unknown users. Minimum 10 characters. Admin-set passwords must be changed at first login.
+* **Two-factor authentication (2FA)**: built-in RFC 6238 TOTP (works with Google Authenticator, Authy, Bitwarden, 1Password) with replay protection and 8 single-use SHA-256 hashed recovery codes, zero third-party libraries.
 * **Sessions**: 256-bit random tokens, only their SHA-256 is kept server side; `HttpOnly`, `Secure`,
-  `SameSite=Strict`, `__Host-` prefix on HTTPS; 12 h idle / 14 d absolute timeout; changing a password
-  signs out all other devices; admins can end sessions.
-* **CSRF**: SameSite=Strict + per-session `X-CSRF-Token` + `Origin` / `Sec-Fetch-Site` checks on every state-changing call.
-* **Brute force**: per-IP and per-account exponential lockout; hashing concurrency is bounded.
+  `SameSite=Strict`, `__Host-` prefix on HTTPS; 12 h idle / 14 d absolute timeout; per-user & global session caps; changing a password rotates the active session and signs out all other devices; admins can end sessions.
+* **CSRF**: SameSite=Strict + per-session `X-CSRF-Token` + scheme-aware `Origin` / `Sec-Fetch-Site` checks on every state-changing call.
+* **Brute force**: per-IP and `(IP, user)` exponential lockouts (preventing single-IP remote account-lockout DoS), bounded memory eviction, per-token link lockout, and bounded hashing concurrency.
 * **Browser hardening**: CSP `default-src 'none'; script-src 'self'` (no inline script/style), `nosniff`,
-  frame denial, no referrer, HSTS. The UI never uses `innerHTML`. Downloads are `attachment` unless the
+  frame denial, no referrer, HSTS (`includeSubDomains`). The UI never uses `innerHTML`. Downloads are `attachment` unless the
   type is on a small safe-preview list, and always carry a sandboxing CSP, so an uploaded HTML/SVG file can never run script on the app's origin.
-* **Uploads** are written to a hidden scratch folder and atomically renamed, so half-written files are never visible
-  and leftovers are removed at startup. The data folder cannot be shared (it holds password hashes and the TLS key).
-* **Audit log** of logins, uploads, downloads, deletes, renames, grants, admin actions (`audit.log`, rotated at 20 MB).
+* **Uploads** are written to a hidden scratch folder and atomically renamed, with per-user/global concurrency & size caps, optional `X-Content-SHA256` / `X-Chunk-SHA256` verification, and mid-upload permission re-checks. The data folder cannot be shared (it holds password hashes and the TLS key).
+* **Tamper-evident audit log** of logins, uploads, downloads, deletes, renames, grants, 2FA, and admin actions (`audit.log`, rotated at 20 MB), HMAC-SHA256 hash-chained with one-click verification in the Admin panel.
 
 Notes: a locked-out account can be unlocked by waiting (max 10 min) or restarting the server. Run it as an
 unprivileged OS user that has access only to the folders you intend to share - the OS permissions of that user remain the final boundary.
