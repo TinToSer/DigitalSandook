@@ -201,6 +201,50 @@ pre {
 }
 .copy-btn { position: absolute; top: 14px; right: 14px; }
 
+/* Deploy Playbook */
+.deploy-card {
+  background: var(--card); border: 1px solid var(--bd); border-radius: var(--rad);
+  overflow: hidden; max-width: 960px; margin: 0 auto;
+}
+.deploy-top {
+  padding: 22px 24px 16px; border-bottom: 1px solid var(--bd);
+  display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px;
+}
+.badges { display: flex; flex-wrap: wrap; gap: 8px; }
+.badge {
+  font-size: 0.76rem; font-weight: 700; padding: 4px 10px; border-radius: 999px;
+  border: 1px solid var(--bd); background: rgba(255,255,255,0.04); color: #cbd5e1;
+}
+.badge.ok { color: var(--ok); border-color: rgba(52,211,153,0.35); background: rgba(52,211,153,0.09); }
+.badge.hi { color: #a5b4fc; border-color: rgba(99,102,241,0.4); background: rgba(99,102,241,0.12); }
+.badge.warn { color: #fbbf24; border-color: rgba(251,191,36,0.35); background: rgba(251,191,36,0.08); }
+.flow {
+  display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 10px;
+  padding: 18px 20px; background: rgba(7, 11, 20, 0.55); border-bottom: 1px solid var(--bd);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.82rem;
+}
+.flow-node {
+  padding: 7px 12px; border-radius: 9px; border: 1px solid var(--bd);
+  background: rgba(15,23,42,0.85); color: #e2e8f0;
+}
+.flow-node.shield { border-color: rgba(52,211,153,0.5); color: #6ee7b7; background: rgba(16,185,129,0.1); }
+.flow-node.block { border-color: rgba(239,68,68,0.45); color: #fca5a5; background: rgba(239,68,68,0.08); }
+.flow-arr { color: var(--acc2); font-weight: 800; }
+.deploy-body { padding: 22px 24px; display: grid; grid-template-columns: 1fr 1.15fr; gap: 22px; align-items: start; }
+.steps { list-style: none; counter-reset: st; display: flex; flex-direction: column; gap: 12px; }
+.steps li { position: relative; padding-left: 34px; font-size: 0.91rem; color: #cbd5e1; }
+.steps li::before {
+  counter-increment: st; content: counter(st);
+  position: absolute; left: 0; top: 1px; width: 22px; height: 22px; border-radius: 50%;
+  background: rgba(99,102,241,0.22); border: 1px solid rgba(99,102,241,0.5);
+  color: #c7d2fe; font-size: 0.76rem; font-weight: 700; display: grid; place-items: center;
+}
+.deploy-code { position: relative; background: #070b14; border: 1px solid var(--bd); border-radius: 12px; padding: 16px; }
+.deploy-tip {
+  margin-top: 12px; font-size: 0.83rem; color: var(--muted);
+  padding: 10px 12px; border-radius: 9px; background: rgba(99,102,241,0.07); border: 1px solid rgba(99,102,241,0.22);
+}
+
 /* Footer */
 footer {
   border-top: 1px solid var(--bd); padding: 38px 0; margin-top: 40px;
@@ -220,6 +264,7 @@ footer a:hover { text-decoration: underline; }
 @media (max-width: 900px) {
   .grid { grid-template-columns: repeat(2, 1fr); }
   .stats { grid-template-columns: repeat(2, 1fr); }
+  .deploy-body { grid-template-columns: 1fr; }
   .nav-links { display: none; }
 }
 @media (max-width: 600px) {
@@ -241,6 +286,7 @@ footer a:hover { text-decoration: underline; }
       <a href="#preview">Screenshots</a>
       <a href="#benefits">Features</a>
       <a href="#compare">Compare</a>
+      <a href="#anywhere">Access Anywhere</a>
       <a href="#install">Quick Start</a>
     </nav>
     <div style="display:flex;gap:10px;align-items:center">
@@ -363,6 +409,42 @@ footer a:hover { text-decoration: underline; }
     </div>
   </section>
 
+  <section id="anywhere">
+    <div class="sec-hd">
+      <h2>Access Your Files From Anywhere</h2>
+      <p>Keep it strictly on your LAN, share public links without opening router ports, or host a full private cloud on a VPS. Pick the pattern that fits your setup:</p>
+    </div>
+
+    <div class="tabs" id="deployTabs">
+      <button class="tab on" data-dep="0" type="button">☁️ Cloudflare Tunnel (Built-In)</button>
+      <button class="tab" data-dep="1" type="button">🔒 Tailscale / WireGuard VPN</button>
+      <button class="tab" data-dep="2" type="button">🖥️ Cloud VPS + Caddy / nginx</button>
+      <button class="tab" data-dep="3" type="button">📡 Router Port Forward + Public IP</button>
+      <button class="tab" data-dep="4" type="button">🚇 ngrok / SSH / Any Tunnel</button>
+    </div>
+
+    <div class="deploy-card">
+      <div class="deploy-top">
+        <div>
+          <h3 id="depTitle" style="font-size:1.18rem;margin-bottom:3px"></h3>
+          <p id="depSub" style="font-size:0.89rem;color:var(--muted)"></p>
+        </div>
+        <div class="badges" id="depBadges"></div>
+      </div>
+      <div class="flow" id="depFlow"></div>
+      <div class="deploy-body">
+        <div>
+          <ol class="steps" id="depSteps"></ol>
+          <div class="deploy-tip" id="depTip"></div>
+        </div>
+        <div class="deploy-code">
+          <button class="btn sm copy-btn" id="depCopy" type="button">Copy</button>
+          <pre id="depCode"></pre>
+        </div>
+      </div>
+    </div>
+  </section>
+
   <section id="install">
     <div class="sec-hd">
       <h2>Up and Running in 10 Seconds</h2>
@@ -446,6 +528,175 @@ copyBtn.addEventListener('click', async () => {
   try { await navigator.clipboard.writeText(snippets[curCode]); copyBtn.textContent = 'Copied!'; setTimeout(() => copyBtn.textContent = 'Copy', 1500); } catch (_) {}
 });
 showCode(0);
+
+const deploys = [
+  {
+    title: 'Built-In Cloudflare Tunnel (Zero Port Forwarding)',
+    sub: 'Best for sharing files & File-Drop links with anyone on the internet while keeping your login & admin panel 100% private.',
+    badges: [['ok', 'Zero Open Ports'], ['hi', 'Works Behind CGNAT'], ['ok', 'Admin Panel Isolated']],
+    flow: [
+      ['Guest Browser', ''], ['Cloudflare HTTPS', 'shield'], ['cloudflared', ''],
+      ['127.0.0.1:8444 (Share Links Only)', 'shield'], ['Login / Admin = 404', 'block']
+    ],
+    steps: [
+      'Install cloudflared (or drop the cloudflared binary right next to DigitalSanDook).',
+      'Open Admin → Internet access in the DigitalSanDook web UI.',
+      'Choose Quick Tunnel (free, instant random URL, no account) OR Named Tunnel (paste your Zero Trust token & custom domain like https://files.example.com).',
+      'Create any public link or File-Drop link — DigitalSanDook automatically uses your tunnel URL while keeping your login & admin panel unreachable from the internet.'
+    ],
+    tip: '💡 Security superpower: Even if someone discovers your tunnel URL, /api/login and /api/admin return 404 through the tunnel. Always add a password + expiry on sensitive links.',
+    code: `# 1. Start DigitalSanDook normally
+./DigitalSanDook -share Projects=/srv/projects
+
+# 2. In the Web UI:
+#    Admin -> Internet access -> Quick or Named Tunnel
+
+# For Named Tunnel in Cloudflare Zero Trust dashboard:
+#   Public Hostname: files.example.com
+#   Service Type:    HTTP
+#   URL:             localhost:8444`
+  },
+  {
+    title: 'Private Mesh VPN (Tailscale / WireGuard / ZeroTier)',
+    sub: 'Best for accessing your FULL file manager & admin panel from your phone or laptop anywhere in the world — with zero public exposure.',
+    badges: [['ok', 'Safest Full Access'], ['hi', 'Zero Open Ports'], ['ok', 'No CGNAT Issues']],
+    flow: [
+      ['Your Phone / Laptop', ''], ['Encrypted WireGuard Mesh', 'shield'],
+      ['Home Server (100.x.y.z)', ''], ['DigitalSanDook :8443 (Full UI)', 'shield']
+    ],
+    steps: [
+      'Install Tailscale (or WireGuard / ZeroTier) on the machine running DigitalSanDook and on your phone/laptop.',
+      'Run DigitalSanDook bound to your Tailscale IP (or all interfaces) with built-in HTTPS.',
+      'Open https://<your-machine-tailscale-ip>:8443 from anywhere on Earth — your server stays completely invisible to internet scanners.',
+      'Optional: Pair with Built-In Cloudflare Tunnel so YOU use Tailscale for full access while external guests only see public share links.'
+    ],
+    tip: '💡 Pro combo: Tailscale for your private full access + Built-In Cloudflare Tunnel for external share links = maximum security with zero exposed login pages.',
+    code: `# Bind strictly to your Tailscale interface IP:
+./DigitalSanDook -addr 100.64.0.12:8443 -share Home=/srv/files
+
+# Or with Tailscale MagicDNS + real HTTPS cert:
+tailscale cert mybox.tail1234.ts.net
+./DigitalSanDook \\
+  -cert mybox.tail1234.ts.net.crt \\
+  -key  mybox.tail1234.ts.net.key \\
+  -share Home=/srv/files`
+  },
+  {
+    title: 'Host on a Cloud VPS + Caddy or nginx (Auto-HTTPS)',
+    sub: 'Best for a permanent, fast, multi-user team cloud on your own domain (DigitalOcean, Hetzner, Oracle Cloud, Linode, AWS).',
+    badges: [['hi', 'Auto Let\'s Encrypt'], ['ok', 'Permanent Domain'], ['ok', 'Multi-User Cloud']],
+    flow: [
+      ['Any Browser (HTTPS :443)', ''], ['Caddy / nginx (TLS)', 'shield'],
+      ['127.0.0.1:1716 (-http -trust-proxy)', 'shield'], ['DigitalSanDook', '']
+    ],
+    steps: [
+      'Point an A / AAAA DNS record for files.yourdomain.com to your VPS public IP.',
+      'Run DigitalSanDook on loopback only (-http -addr 127.0.0.1:1716 -trust-proxy) as an unprivileged user.',
+      'Put Caddy (3 lines, automatic Let\'s Encrypt!) or nginx in front to terminate HTTPS and forward real client IPs.',
+      'Enable TOTP 2FA on your admin account immediately after first login.'
+    ],
+    tip: '💡 Because DigitalSanDook is a single ~7 MB static binary, it runs effortlessly even on a $4/mo 512 MB RAM VPS with zero database overhead.',
+    code: `# 1. Run DigitalSanDook on loopback only:
+./DigitalSanDook -http -addr 127.0.0.1:1716 -trust-proxy \\
+  -data /var/lib/dsd -share Team=/srv/team
+
+# 2. /etc/caddy/Caddyfile (automatic HTTPS!):
+files.yourdomain.com {
+    reverse_proxy 127.0.0.1:1716
+}
+
+# 3. Firewall: allow ONLY 80 & 443 (keep 1716 closed):
+sudo ufw allow 80,443/tcp && sudo ufw enable`
+  },
+  {
+    title: 'Home Router Port Forwarding + Public IP / DDNS',
+    sub: 'Direct high-speed home connection with no middleman bandwidth caps — ideal if your ISP gives you a real public IPv4/IPv6.',
+    badges: [['hi', 'Direct Full Speed'], ['warn', 'Requires Public IP'], ['ok', 'Auto-Reloading TLS']],
+    flow: [
+      ['Internet Browser', ''], ['Router NAT (TCP :8443)', ''],
+      ['Home PC :8443 (Built-In HTTPS)', 'shield'], ['TOTP 2FA + Lockout', 'shield']
+    ],
+    steps: [
+      'Assign your home server a static LAN IP (e.g., 192.168.1.50) in your router DHCP settings.',
+      'In your router Port Forwarding / NAT page, forward external TCP port 8443 (or 443) → 192.168.1.50:8443.',
+      'Set up free Dynamic DNS (DuckDNS, Cloudflare DDNS, or No-IP) so your domain updates if your home IP changes.',
+      'Pass real Let\'s Encrypt certs via -cert and -key (DigitalSanDook hot-reloads renewed certs automatically with zero restart!) and enable TOTP 2FA.'
+    ],
+    tip: '⚠️ Check if you are behind CGNAT: compare your router\'s WAN IP with whatismyip.com. If they differ, your ISP uses CGNAT — use Cloudflare Tunnel or Tailscale instead.',
+    code: `# Run with Let's Encrypt certs (auto hot-reloaded on renewal!):
+./DigitalSanDook \\
+  -addr :8443 \\
+  -cert /etc/letsencrypt/live/home.duckdns.org/fullchain.pem \\
+  -key  /etc/letsencrypt/live/home.duckdns.org/privkey.pem \\
+  -share Media=/mnt/nas/media
+
+# Then open from anywhere:
+#   https://home.duckdns.org:8443`
+  },
+  {
+    title: 'Any Other Tunnel (ngrok, Pinggy, Bore, SSH Reverse Tunnel)',
+    sub: 'Need a quick temporary tunnel or already have an SSH jump box? DigitalSanDook works cleanly behind any HTTP/TLS tunnel.',
+    badges: [['hi', 'Zero Config'], ['ok', 'Works Anywhere'], ['warn', 'Enable 2FA']],
+    flow: [
+      ['Browser (HTTPS)', ''], ['ngrok / SSH Jump Box', 'shield'],
+      ['127.0.0.1:1716 (-http -trust-proxy)', ''], ['DigitalSanDook', 'shield']
+    ],
+    steps: [
+      'Start DigitalSanDook on loopback (-http -addr 127.0.0.1:1716 -trust-proxy) so it cannot be reached directly.',
+      'Launch your preferred tunnel pointing at http://127.0.0.1:1716 (make sure the tunnel preserves the Host header).',
+      'Make sure your password is strong and TOTP 2FA is enabled before exposing the full UI over a public tunnel.'
+    ],
+    tip: '💡 DigitalSanDook enforces strict Origin == Host CSRF checks. Always ensure your tunnel or reverse proxy passes the public Host header unchanged.',
+    code: `# Start locally on loopback:
+./DigitalSanDook -http -addr 127.0.0.1:1716 -trust-proxy -share Docs=./docs
+
+# Option A — ngrok:
+ngrok http 1716
+
+# Option B — Reverse SSH tunnel via your own VPS:
+ssh -N -R 1716:127.0.0.1:1716 user@your-vps.com
+
+# Option C — Pinggy (no install required):
+ssh -p 443 -R0:127.0.0.1:1716 a.pinggy.io`
+  }
+];
+
+const depTitle = document.getElementById('depTitle');
+const depSub = document.getElementById('depSub');
+const depBadges = document.getElementById('depBadges');
+const depFlow = document.getElementById('depFlow');
+const depSteps = document.getElementById('depSteps');
+const depTip = document.getElementById('depTip');
+const depCode = document.getElementById('depCode');
+const depCopy = document.getElementById('depCopy');
+let curDep = 0;
+
+function showDeploy(i) {
+  curDep = i;
+  const d = deploys[i];
+  depTitle.textContent = d.title;
+  depSub.textContent = d.sub;
+  depBadges.replaceChildren(...d.badges.map(([cls, txt]) => {
+    const s = document.createElement('span'); s.className = 'badge ' + cls; s.textContent = txt; return s;
+  }));
+  depFlow.replaceChildren();
+  d.flow.forEach(([txt, cls], idx) => {
+    if (idx > 0) { const a = document.createElement('span'); a.className = 'flow-arr'; a.textContent = '→'; depFlow.append(a); }
+    const n = document.createElement('span'); n.className = 'flow-node ' + cls; n.textContent = txt; depFlow.append(n);
+  });
+  depSteps.replaceChildren(...d.steps.map(t => { const li = document.createElement('li'); li.textContent = t; return li; }));
+  depTip.textContent = d.tip;
+  depCode.textContent = d.code;
+}
+document.getElementById('deployTabs').addEventListener('click', ev => {
+  const b = ev.target.closest('.tab'); if (!b) return;
+  document.querySelectorAll('#deployTabs .tab').forEach(t => t.classList.remove('on'));
+  b.classList.add('on'); showDeploy(+b.dataset.dep);
+});
+depCopy.addEventListener('click', async () => {
+  try { await navigator.clipboard.writeText(deploys[curDep].code); depCopy.textContent = 'Copied!'; setTimeout(() => depCopy.textContent = 'Copy', 1500); } catch (_) {}
+});
+showDeploy(0);
 </script>
 </body>
 </html>
